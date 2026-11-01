@@ -7,8 +7,8 @@ export const STAGES: { id: StageId; label: string; station: StationId; icon: str
   { id: "brief", label: "Brief", station: "cutting", icon: "think", verb: "Reading the brief", detail: ["Applying your saved style", "Reading the transcript"] },
   { id: "cut", label: "A-cuts", station: "cutting", icon: "scissors", verb: "Cutting A-roll", detail: ["Removing retakes", "Keeping intentional pauses", "Trimming dead air"] },
   { id: "broll", label: "B-roll", station: "library", icon: "book", verb: "Searching B-roll", detail: ["Writing creative angles", "Checking filmstrips", "Matching shots to words"] },
-  { id: "animate", label: "Motion", station: "animation", icon: "pen", verb: "Animating graphics", detail: ["Building an explainer scene", "Timing shapes to words"] },
   { id: "captions", label: "Captions", station: "captions", icon: "text", verb: "Timing captions", detail: ["Aligning words", "Styling highlights"] },
+  { id: "animate", label: "Motion", station: "animation", icon: "pen", verb: "Animating graphics", detail: ["Building an explainer scene", "Timing shapes to words"] },
   { id: "sound", label: "Sound", station: "sound", icon: "note", verb: "Designing sound", detail: ["Placing effects", "Ducking music", "Balancing loudness"] },
   { id: "render", label: "Render", station: "render", icon: "gear", verb: "Rendering", detail: ["Rendering frames", "Running quality checks"] },
   { id: "review", label: "Review", station: "review", icon: "star", verb: "Ready for review", detail: ["Waiting at the Review Bale"] },
@@ -44,6 +44,20 @@ export const CREW_SEED: { name: string; role: string; look: number; mission: Mis
 ];
 
 export type ModelOption = { id: string; name: string; note: string; group: "Recommended" | "Older versions"; efforts: string[]; defaultEffort: string; usesFable?: boolean };
+
+/** Claude Code's short aliases always point at the newest model, so they list first. */
+export function modelOptions(models: { id: string; name: string; description: string; resolved: string | null; efforts: string[]; fable: boolean }[]): ModelOption[] {
+  if (!models.length) return MODELS;
+  return models.map((m) => ({
+    id: m.id,
+    name: m.name,
+    note: m.description.split(/ · |\. /)[0] || m.resolved || m.id,
+    group: m.id.startsWith("claude-") ? "Older versions" : "Recommended",
+    efforts: m.efforts,
+    defaultEffort: m.efforts.includes("medium") ? "medium" : (m.efforts[0] ?? ""),
+    usesFable: m.fable,
+  }));
+}
 
 const FULL = ["low", "medium", "high", "xhigh", "max"];
 const NO_XHIGH = ["low", "medium", "high", "max"];
@@ -137,10 +151,10 @@ export const PROMPT_CARDS = [
 ];
 
 export const TOOLS = [
-  { name: "Remove background", note: "Saves a transparent video", tag: "Local · Free", icon: "sparkles" },
-  { name: "Transcribe", note: "Word-timed transcript", tag: "Local · Free", icon: "text" },
-  { name: "Cut silences", note: "Protects intentional pauses", tag: "Local · Free", icon: "scissors" },
-  { name: "Reframe to vertical", note: "Tracks the speaker", tag: "Local · Free", icon: "movie" },
-  { name: "Depth parallax", note: "Downloads a model pack", tag: "Local · Pack", icon: "bolt" },
-  { name: "3D camera track", note: "Downloads a model pack", tag: "Local · Pack", icon: "gear" },
+  { id: "removeBackground", name: "Remove background", note: "Saves a transparent video", tag: "Local · Free", icon: "sparkles", params: { subject: "person", quality: "accurate", codec: "prores" } },
+  { id: "transcribe", name: "Transcribe", note: "Word-timed transcript", tag: "Local · Free", icon: "text", params: { locale: "en-US" } },
+  { id: "cutSilences", name: "Cut silences", note: "Keeps a short natural beat", tag: "Local · Free", icon: "scissors", params: { keepPause: 0.3 } },
+  { id: "reframe", name: "Reframe to vertical", note: "Tracks the speaker", tag: "Local · Free", icon: "movie", params: { width: 1080, height: 1920 } },
+  { id: "parallax", name: "Depth parallax", note: "Turns a frame into a 3D move", tag: "Local · Pack", icon: "bolt", pack: "depth", params: { move: "dolly", duration: 4, amount: 0.04 } },
+  { id: "track", name: "3D camera track", note: "Solves a moving camera", tag: "Local · Pack", icon: "gear", pack: "colmap", params: {} },
 ];

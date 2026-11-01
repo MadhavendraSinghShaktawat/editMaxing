@@ -1,6 +1,7 @@
 import { Moon, Plus, Sun, Sunset } from "lucide-react";
 import { useState } from "react";
 import { LOOKS, STAGES } from "../sim/data";
+import { resetLabel } from "../sim/engine";
 import { Editor, MAX_EDITORS, Theme, stateLabel, store, useStore } from "../sim/store";
 import { Icon } from "./Icon";
 import { Portrait } from "./Pixel";
@@ -62,37 +63,60 @@ function ThemeSwitch() {
   );
 }
 
-export function TopBar() {
+export function TopBar({ onAccounts }: { onAccounts: () => void }) {
   const s = useStore();
   const [open, setOpen] = useState(false);
+  const account = s.live ? s.activeAccount() : null;
+  const limits = account?.limits ?? [];
+  const model = limits.filter((l) => l.kind === "model");
+  const reset = (min: number) => (s.live ? (min ? fmt(min) : "unknown") : fmt(min));
   return (
     <header className="topbar glass">
       <div className="brand">
         <b>Shifu Dojo</b>
       </div>
 
-      <div className="lifebars">
-        <LifeBar label="5-hour session" value={s.usage.session} reset={fmt(s.usage.sessionResetMin)} tone="green" icon="heart" />
-        <LifeBar label="Weekly" value={s.usage.weekly} reset={fmt(s.usage.weeklyResetMin)} tone="blue" icon="bolt" />
-        <LifeBar label="Fable" value={s.usage.fable} reset={fmt(s.usage.fableResetMin)} tone="gold" icon="star" />
-      </div>
+      {s.live && !limits.length ? (
+        <div className="lifebars none">{!s.online ? "Connecting to the engine…" : account?.kind === "api_key" ? "This account is billed by API usage" : account?.signedIn === false ? "Sign in to a Claude account to start" : "Reading your limits…"}</div>
+      ) : (
+        <div className="lifebars">
+          <LifeBar label="5-hour session" value={s.usage.session} reset={reset(s.usage.sessionResetMin)} tone="green" icon="heart" />
+          <LifeBar label="Weekly" value={s.usage.weekly} reset={reset(s.usage.weeklyResetMin)} tone="blue" icon="bolt" />
+          {s.live ? model.map((m) => <LifeBar key={m.id} label={m.label} value={1 - m.usedPercent / 100} reset={resetLabel(m.resetsAt)} tone="gold" icon="star" />) : <LifeBar label="Fable" value={s.usage.fable} reset={fmt(s.usage.fableResetMin)} tone="gold" icon="star" />}
+        </div>
+      )}
 
       <ThemeSwitch />
 
       <div className="account">
         <button className="account-btn" aria-expanded={open} onClick={() => setOpen(!open)}>
-          <span className="dot" /> Maddy <span aria-hidden="true">▾</span>
+          <span className={`dot ${account?.signedIn === false ? "off" : ""}`} /> {account?.label ?? "Maddy"} <span aria-hidden="true">▾</span>
         </button>
         {open && (
           <div className="account-menu glass" role="menu">
-            <button role="menuitem" onClick={() => setOpen(false)}>
-              <span className="dot" /> Maddy · Max
-            </button>
-            <button role="menuitem" onClick={() => setOpen(false)}>
-              <span className="dot off" /> Studio 2 · Max
-            </button>
-            <button role="menuitem" className="muted" onClick={() => setOpen(false)}>
-              + Add account
+            {s.accounts.map((a) => (
+              <button
+                key={a.id}
+                role="menuitem"
+                onClick={() => {
+                  setOpen(false);
+                  s.useAccount(a.id);
+                }}
+              >
+                <span className={`dot ${a.signedIn ? "" : "off"}`} /> {a.label}
+                {a.plan ? ` · ${a.plan}` : ""}
+                {a.limits[0] ? ` · ${Math.round(a.limits[0].usedPercent)}% used` : ""}
+              </button>
+            ))}
+            <button
+              role="menuitem"
+              className="muted"
+              onClick={() => {
+                setOpen(false);
+                onAccounts();
+              }}
+            >
+              Manage accounts
             </button>
           </div>
         )}
@@ -157,22 +181,23 @@ export function EmptyStudio() {
   );
 }
 
-export type BoardId = "styles" | "prompts" | "library" | "tools";
+export type BoardId = "styles" | "prompts" | "library" | "tools" | "settings";
 
-export function Dock({ onBoard }: { onBoard: (b: BoardId) => void }) {
+export function Dock({ onBoard, onVideo }: { onBoard: (b: BoardId) => void; onVideo: () => void }) {
   const s = useStore();
   const items: { id: BoardId; label: string; icon: string }[] = [
     { id: "styles", label: "Styles", icon: "pen" },
     { id: "prompts", label: "Prompts", icon: "text" },
     { id: "library", label: "B-roll", icon: "book" },
-    { id: "tools", label: "Tools", icon: "gear" },
+    { id: "tools", label: "Tools", icon: "sparkles" },
+    { id: "settings", label: "Settings", icon: "gear" },
   ];
   const queue = s.needsYou();
   return (
     <nav className="dock glass" aria-label="Studio">
-      <button className="mission-btn" disabled={s.editors.length >= MAX_EDITORS} onClick={() => s.newChat()}>
+      <button className="mission-btn" disabled={s.editors.length >= MAX_EDITORS} onClick={onVideo}>
         <Plus size={17} strokeWidth={2.4} />
-        New chat
+        New video
       </button>
       {items.map((it) => (
         <button key={it.id} className="dock-btn" onClick={() => onBoard(it.id)}>

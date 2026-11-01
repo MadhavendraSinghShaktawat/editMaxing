@@ -3,37 +3,41 @@ import Combine
 import Foundation
 import WebKit
 
-/// Owns the local web server and the window's web view, so menus can act on them.
+/// Owns the local engine and the window's web view, so menus can act on them.
 @MainActor
 final class Studio: ObservableObject {
     @Published private(set) var address: URL?
     @Published private(set) var failure: String?
     weak var webView: WKWebView?
-    private var server: LocalServer?
+    private var engine: Engine?
 
     init() {
-        guard let root = Bundle.main.resourceURL?.appendingPathComponent("web"),
-              FileManager.default.fileExists(atPath: root.appendingPathComponent("index.html").path)
-        else {
+        guard let resources = Bundle.main.resourceURL else {
             failure = "The studio files are missing from this copy of the app. Please download it again."
             return
         }
-        let server = LocalServer(root: root)
-        self.server = server
-        server.start { [weak self] result in
-            Task { @MainActor in
-                switch result {
-                case .success(let port): self?.address = URL(string: "http://127.0.0.1:\(port)/")
-                case .failure(let error): self?.failure = error.localizedDescription
-                }
-            }
+        let engine = Engine(
+            resources: resources,
+            onReady: { [weak self] url in Task { @MainActor in self?.address = url } },
+            onFailure: { [weak self] message in Task { @MainActor in self?.failure = message } }
+        )
+        self.engine = engine
+        do {
+            try engine.start()
+        } catch {
+            failure = error.localizedDescription
         }
+    }
+
+    func stop() {
+        engine?.stop()
     }
 
     func reload() {
         webView?.reload()
     }
 
+    /// The address carries this Mac's sign-in link, so the browser opens signed in.
     func openInBrowser() {
         if let address { NSWorkspace.shared.open(address) }
     }

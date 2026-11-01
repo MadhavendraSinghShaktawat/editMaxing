@@ -1,12 +1,15 @@
 import { Check, ChevronDown, Flame, Search } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { MODELS } from "../sim/data";
+import { modelOptions } from "../sim/data";
+import { useStore } from "../sim/store";
 
-export function ModelPicker({ model, effort, onChange, up = true }: { model: string; effort: string; onChange: (model: string, effort: string) => void; up?: boolean }) {
+export function ModelPicker({ model, effort, onChange, up = true, accountId }: { model: string; effort: string; onChange: (model: string, effort: string) => void; up?: boolean; accountId?: string }) {
+  const s = useStore();
+  const MODELS = useMemo(() => modelOptions(s.live ? s.modelsFor(accountId) : []), [s, s.accounts, accountId]);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const root = useRef<HTMLDivElement>(null);
-  const current = MODELS.find((m) => m.id === model) ?? MODELS[2];
+  const current = MODELS.find((m) => m.id === model) ?? MODELS.find((m) => m.id === "sonnet") ?? MODELS[0];
 
   useEffect(() => {
     if (!open) return;
@@ -23,7 +26,7 @@ export function ModelPicker({ model, effort, onChange, up = true }: { model: str
   const list = useMemo(() => {
     const q = query.toLowerCase();
     return MODELS.filter((m) => m.name.toLowerCase().includes(q) || m.id.includes(q) || m.note.toLowerCase().includes(q));
-  }, [query]);
+  }, [query, MODELS]);
 
   const pick = (id: string) => {
     const next = MODELS.find((m) => m.id === id)!;

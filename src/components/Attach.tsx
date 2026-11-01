@@ -1,6 +1,7 @@
 import { Check, Film, ImageIcon, Loader2, Paperclip, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Attachment } from "../sim/store";
+import { uploadFile } from "../sim/engine";
+import { Attachment, store } from "../sim/store";
 
 export type Pending = Attachment & { progress: number; error?: string };
 
@@ -56,7 +57,13 @@ export function useAttachments(defaultRole: Attachment["role"]) {
         if (tooBig) continue;
         const meta = kind === "video" ? await inspectVideo(file) : kind === "image" ? { thumb: URL.createObjectURL(file) } : {};
         setItems((v) => v.map((x) => (x.id === id ? { ...x, ...meta } : x)));
-        // Stand-in for the local engine copying the file into the mission folder.
+        if (store.live) {
+          // Files stay on this Mac. The engine stores each one by content, so a re-upload costs nothing.
+          uploadFile(file, (progress) => setItems((v) => v.map((x) => (x.id === id ? { ...x, progress } : x))))
+            .then((stored) => setItems((v) => v.map((x) => (x.id === id ? { ...x, hash: stored.hash, duration: x.duration ?? stored.meta.duration, progress: 1 } : x))))
+            .catch((e: Error) => setItems((v) => v.map((x) => (x.id === id ? { ...x, error: e.message } : x))));
+          continue;
+        }
         const timer = window.setInterval(() => {
           setItems((v) =>
             v.map((x) => {
@@ -77,7 +84,7 @@ export function useAttachments(defaultRole: Attachment["role"]) {
   const setRole = (id: string, role: Attachment["role"]) => setItems((v) => v.map((x) => (x.id === id ? { ...x, role } : x)));
   const clear = () => setItems([]);
   const busy = items.some((x) => x.progress < 1 || x.error);
-  const ready = (): Attachment[] => items.filter((x) => !x.error).map(({ id, name, kind, role, size, duration, thumb }) => ({ id, name, kind, role, size, duration, thumb }));
+  const ready = (): Attachment[] => items.filter((x) => !x.error).map(({ id, name, kind, role, size, duration, thumb, hash }) => ({ id, name, kind, role, size, duration, thumb, hash }));
   return { items, add, remove, setRole, clear, busy, ready };
 }
 

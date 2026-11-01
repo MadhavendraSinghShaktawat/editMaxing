@@ -3,6 +3,7 @@ import { DOCK, Facing, STATIONS, Spot, StationId } from "../world/layout";
 import { findPath } from "../world/nav";
 import { Pose } from "../world3d/types";
 import { BROLL_PROMPTS, CHAT_NAMES, CREW_SEED, Mission, QUEUED_MISSIONS, STAGES, StageId, Thumb } from "./data";
+import { Account, Brief, ChatStatus, ChatView, EngineDecision, EngineMessage, EngineStyle, EventType, Job, LibraryStats, MemoryRule, Pack, Recipe, State, api, connect, leftOf } from "./engine";
 
 export type Activity = "working" | "walking" | "thinking" | "needs" | "coffee" | "chatting" | "celebrating" | "resting" | "stuck" | "waiting";
 
@@ -21,6 +22,8 @@ export type Message = {
   tool?: string;
   decision?: Decision;
   attachments?: Attachment[];
+  video?: { url: string; quality?: { pass: boolean; checks: { name: string; ok: boolean; detail: string }[] } | null; srt?: string | null; fcpxml?: string | null };
+  error?: boolean;
 };
 
 export type Attachment = {
@@ -31,6 +34,7 @@ export type Attachment = {
   size: number;
   duration?: number;
   thumb?: string;
+  hash?: string;
 };
 
 export type Editor = {
@@ -62,9 +66,19 @@ export type Editor = {
   thought: number;
   model: string;
   effort: string;
+  accountId: string;
+  draft: string;
+  status: ChatStatus;
+  loaded: boolean;
+  questions: EngineDecision[];
+  started: boolean;
 };
 
 export const MAX_EDITORS = 8;
+
+const ACTIVITY: Record<ChatStatus, Activity> = { idle: "waiting", working: "working", thinking: "thinking", needs: "needs", stuck: "stuck", resting: "resting" };
+const STAGE_INDEX: Record<string, number> = { cutting: 1, broll: 2, captions: 3, graphics: 4, sound: 5, review: 7 };
+const POSE: Partial<Record<StationId, Pose>> = { library: "read", render: "watch", review: "watch" };
 
 export type Theme = "day" | "evening" | "night";
 export const THEME_HOURS: Record<Theme, number> = { day: 12.5, evening: 18.1, night: 21.5 };
@@ -102,6 +116,21 @@ class Store {
   minutesSaved = 1284;
   shipped = 37;
   lastModel = { model: "sonnet", effort: "medium" };
+  /** With ?demo the world runs on sample data. Otherwise everything comes from the engine. */
+  live = !new URLSearchParams(location.search).has("demo");
+  online = false;
+  accounts: Account[] = [];
+  modes: State["modes"] = [];
+  styles: EngineStyle[] = [];
+  recipes: Recipe[] = [];
+  memory: MemoryRule[] = [];
+  packs: Pack[] = [];
+  keys: Record<string, boolean> = {};
+  library: LibraryStats | null = null;
+  jobs = new Map<string, Job>();
+  settings: State["settings"] = { account: "default", model: "sonnet", effort: "medium", embedModel: "" };
+  login: { id: string; status: string; url?: string; label?: string } | null = null;
+  pendingDraft: string | null = null;
   private names = [...CHAT_NAMES];
   private queue: Mission[] = [];
   private listeners = new Set<() => void>();
@@ -111,7 +140,241 @@ class Store {
     const session = Number(new URLSearchParams(location.search).get("session"));
     if (session > 0 && session <= 1) this.usage.session = session;
     applyTheme(this.theme);
-    if (new URLSearchParams(location.search).has("demo")) this.seedDemo();
+    if (this.live) void this.boot();
+    else this.seedDemo();
+  }
+
+  private async boot() {
+    connect((type, data) => this.onEvent(type, data), () => void this.refresh(), () => {
+      this.online = false;
+      this.emit();
+    });
+  }
+
+  /** Runs on every connect, so a reconnect also heals anything missed while offline. */
+  async refresh() {
+    try {
+      const s = await api<State>("GET", "/api/state");
+      this.online = true;
+      this.accounts = s.accounts;
+      this.modes = s.modes;
+      this.styles = s.styles;
+      this.recipes = s.recipes;
+      this.memory = s.memory;
+      this.packs = s.packs;
+      this.keys = s.keys;
+      this.library = s.library;
+      this.settings = s.settings;
+      this.lastModel = { model: s.settings.model, effort: s.settings.effort };
+      for (const j of s.jobs) this.jobs.set(j.id, j);
+      const known = new Set(s.chats.map((c) => c.id));
+      for (const e of this.editors) if (!known.has(e.id) && e.after !== "leave") this.dismiss(e);
+      for (const c of s.chats) this.syncChat(c);
+      for (const e of this.editors) e.questions = s.decisions.filter((d) => d.chatId === e.id);
+      if (this.selectedId) await this.loadMessages(this.selectedId);
+      this.syncUsage();
+      this.emit();
+    } catch {
+      this.online = false;
+      this.emit();
+    }
+  }
+
+  /** The account whose limits show in the top bar: the open chat's, or the default. */
+  activeAccount() {
+    const id = this.selected()?.accountId ?? this.settings.account;
+    return this.accounts.find((a) => a.id === id) ?? this.accounts[0] ?? null;
+  }
+
+  modelsFor(accountId?: string) {
+    return (this.accounts.find((a) => a.id === accountId) ?? this.activeAccount())?.models ?? [];
+  }
+
+  private syncUsage() {
+    const limits = this.activeAccount()?.limits ?? [];
+    const minutes = (iso: string | null | undefined) => (iso ? Math.max(0, (new Date(iso).getTime() - Date.now()) / 60000) : 0);
+    const session = limits.find((l) => l.kind === "session");
+    const weekly = limits.find((l) => l.kind === "weekly");
+    const fable = limits.find((l) => l.id === "model:fable");
+    this.usage = { session: leftOf(session) ?? 1, weekly: leftOf(weekly) ?? 1, fable: leftOf(fable) ?? 1, sessionResetMin: minutes(session?.resetsAt), weeklyResetMin: minutes(weekly?.resetsAt), fableResetMin: minutes(fable?.resetsAt) };
+  }
+
+  private missionOf(c: ChatView): Mission | null {
+    const brief = (c.mission ?? {}) as Brief;
+    if (!brief.title) return null;
+    const mode = this.modes.find((m) => m.id === brief.modeId)?.label ?? "Custom";
+    const style = this.styles.find((v) => v.id === brief.styleId)?.name ?? "Default";
+    return { title: brief.title, mode, style, length: "--:--" };
+  }
+
+  private syncChat(c: ChatView) {
+    let e = this.editors.find((v) => v.id === c.id);
+    if (!e) {
+      e = this.makeEditor(c.name, "All-round editor", c.look, null, 392, 428);
+      e.id = c.id;
+      this.names = this.names.filter((n) => n.name !== c.name);
+      this.editors.push(e);
+      this.walkTo(e, "living", "waiting", 12 + Math.random() * 10);
+    }
+    const wasReview = e.stage === 7;
+    e.mission = this.missionOf(c);
+    e.model = c.model;
+    e.effort = c.effort ?? "";
+    e.accountId = c.accountId;
+    e.status = c.status;
+    if (c.stage) e.stage = STAGE_INDEX[c.stage] ?? e.stage;
+    if (c.station === "render" && c.status === "working") e.stage = 6;
+    e.overall = e.stage / (STAGES.length - 1);
+    if (c.status !== "idle") e.detail = c.detail || STAGES[e.stage].verb;
+    if (c.status === "idle" && e.stage === 7 && !wasReview) {
+      e.activity = "celebrating";
+      e.timer = 3;
+      this.walkTo(e, "review", "celebrating", 3);
+      e.detail = "Ready for review";
+      return;
+    }
+    const station = c.station as StationId;
+    if (c.status !== "idle" && station !== e.station && STATIONS[station]) this.walkTo(e, station, "working");
+    else if (!e.path.length && c.status !== "idle") e.activity = ACTIVITY[c.status];
+    else if (c.status === "idle" && (e.activity === "working" || e.activity === "thinking" || e.activity === "stuck" || e.activity === "needs")) {
+      e.activity = "waiting";
+      e.timer = e.stage === 7 ? 9999 : 8 + Math.random() * 10;
+      e.detail = e.stage === 7 ? "Ready for review" : "Wandering the villa";
+    }
+  }
+
+  private toMessage(m: EngineMessage, chatId: string): Message {
+    const d = m.data ?? {};
+    const from = m.role === "user" ? "user" : m.role === "system" ? "system" : "editor";
+    const out: Message = { id: m.id, from, text: m.text };
+    if (m.kind === "tool") out.tool = m.text;
+    if (m.kind === "error") out.error = true;
+    if (m.kind === "video") {
+      const name = String(d.path ?? "").split("/").pop() ?? "";
+      const part = (p: unknown) => (p ? `/api/chats/${chatId}/out/${encodeURIComponent(String(p).split("/").pop()!)}` : null);
+      out.video = { url: `/api/chats/${chatId}/out/${encodeURIComponent(name)}`, quality: d.quality as NonNullable<Message["video"]>["quality"], srt: part(d.srt), fcpxml: part(d.fcpxml) };
+    }
+    const files = d.attachments as { hash: string; name: string; role: Attachment["role"]; kind: Attachment["kind"]; duration?: number }[] | undefined;
+    if (files) out.attachments = files.map((f) => ({ id: f.hash, hash: f.hash, name: f.name, kind: f.kind, role: f.role, size: 0, duration: f.duration }));
+    return out;
+  }
+
+  async loadMessages(id: string) {
+    const r = await api<{ messages: EngineMessage[]; decisions: EngineDecision[] }>("GET", `/api/chats/${id}/messages`);
+    const e = this.editors.find((v) => v.id === id);
+    if (!e) return;
+    e.messages = r.messages.map((m) => this.toMessage(m, id));
+    e.questions = r.decisions;
+    e.started = r.messages.length > 0;
+    e.loaded = true;
+    this.emit();
+  }
+
+  private onEvent(type: EventType, data: never) {
+    const editor = (id: string) => this.editors.find((e) => e.id === id);
+    switch (type) {
+      case "chat":
+        this.syncChat(data as ChatView);
+        break;
+      case "chat.ended": {
+        const e = editor((data as { id: string }).id);
+        if (e) this.dismiss(e);
+        break;
+      }
+      case "message": {
+        const m = data as EngineMessage & { chatId: string };
+        const e = editor(m.chatId);
+        if (!e) break;
+        e.started = true;
+        if (m.kind === "text" && m.role === "editor") e.draft = "";
+        if (e.loaded && !e.messages.some((v) => v.id === m.id)) e.messages.push(this.toMessage(m, m.chatId));
+        break;
+      }
+      case "delta": {
+        const d = data as { chatId: string; text: string };
+        const e = editor(d.chatId);
+        if (e) e.draft = d.text;
+        break;
+      }
+      case "decision": {
+        const d = data as EngineDecision;
+        editor(d.chatId)?.questions.push(d);
+        break;
+      }
+      case "decision.closed": {
+        const d = data as { id: string; chatId: string };
+        const e = editor(d.chatId);
+        if (e) e.questions = e.questions.filter((q) => q.id !== d.id);
+        break;
+      }
+      case "account": {
+        const a = data as Account;
+        const i = this.accounts.findIndex((v) => v.id === a.id);
+        if (i >= 0) this.accounts[i] = a;
+        else this.accounts.push(a);
+        this.syncUsage();
+        break;
+      }
+      case "account.removed":
+        this.accounts = this.accounts.filter((a) => a.id !== (data as { id: string }).id);
+        break;
+      case "account.login":
+        this.login = data as NonNullable<Store["login"]>;
+        break;
+      case "job": {
+        const j = data as Job;
+        this.jobs.set(j.id, { ...this.jobs.get(j.id), ...j });
+        break;
+      }
+      case "library":
+        this.library = data as LibraryStats;
+        break;
+      case "library.warning":
+        this.notify((data as { message: string }).message);
+        break;
+      case "style": {
+        const v = data as EngineStyle;
+        this.styles = [...this.styles.filter((o) => o.id !== v.id), v];
+        break;
+      }
+      case "style.removed":
+        this.styles = this.styles.filter((o) => o.id !== (data as { id: string }).id);
+        break;
+      case "recipe":
+        this.recipes = [...this.recipes, data as Recipe];
+        break;
+      case "memory":
+        this.memory = [data as MemoryRule, ...this.memory];
+        break;
+      case "limit":
+        this.notify("An editor is waiting for the usage limit to reset.");
+        break;
+    }
+    this.emit();
+  }
+
+  notify(text: string) {
+    this.toast = { text, id: uid() };
+    this.emit();
+  }
+
+  /** Runs an engine call and turns any failure into a plain toast. */
+  async attempt<T>(work: () => Promise<T>) {
+    try {
+      return await work();
+    } catch (e) {
+      this.notify((e as Error).message);
+      return null;
+    }
+  }
+
+  private dismiss(e: Editor) {
+    if (this.selectedId === e.id) this.selectedId = null;
+    e.mission = null;
+    e.questions = [];
+    e.status = "idle";
+    this.walkTo(e, "dock", "leave");
+    e.detail = "Heading home";
   }
 
   /** Sample crew for demos and tests. A normal studio starts empty. */
@@ -186,6 +449,12 @@ class Store {
       thought: 6 + Math.random() * 12,
       model: "sonnet",
       effort: "medium",
+      accountId: "default",
+      draft: "",
+      status: "idle",
+      loaded: false,
+      questions: [],
+      started: false,
     };
   }
 
@@ -213,6 +482,10 @@ class Store {
 
   /** A new chat is a new editor: they step off the dock and walk up to the villa. */
   newChat() {
+    if (this.live) {
+      void this.createChat();
+      return null;
+    }
     if (this.editors.length >= MAX_EDITORS) {
       this.toast = { text: `Your studio is full. End a chat to make room for another editor.`, id: uid() };
       this.emit();
@@ -229,8 +502,20 @@ class Store {
     return e;
   }
 
+  async createChat(options: { accountId?: string; model?: string; effort?: string; brief?: Brief } = {}) {
+    const view = await this.attempt(() => api<ChatView>("POST", "/api/chats", { model: this.lastModel.model, effort: this.lastModel.effort, ...options }));
+    if (!view) return null;
+    this.syncChat(view);
+    this.select(view.id);
+    return view;
+  }
+
   /** The editor walks back to the dock and leaves. Their name returns to the pool. */
   endChat(id: string) {
+    if (this.live) {
+      void this.attempt(() => api("DELETE", `/api/chats/${id}`));
+      return;
+    }
     const e = this.editors.find((v) => v.id === id);
     if (!e) return;
     e.mission = null;
@@ -256,11 +541,31 @@ class Store {
 
   select(id: string | null) {
     this.selectedId = id;
+    if (this.live) {
+      this.syncUsage();
+      if (id) void this.attempt(() => this.loadMessages(id));
+    }
     this.emit();
   }
 
+  /** The account the next chat starts on. A running chat keeps its own. */
+  useAccount(id: string) {
+    this.settings = { ...this.settings, account: id };
+    void this.attempt(() => api("POST", "/api/settings", { account: id }));
+    this.syncUsage();
+    this.emit();
+  }
+
+  answer(decisionId: string, answer: unknown) {
+    void this.attempt(() => api("POST", `/api/decisions/${decisionId}`, { answer }));
+  }
+
+  stop(id: string) {
+    void this.attempt(() => api("POST", `/api/chats/${id}/interrupt`));
+  }
+
   needsYou() {
-    return this.editors.filter((e) => e.activity === "needs" || (e.mission && STAGES[e.stage].id === "review"));
+    return this.editors.filter((e) => e.activity === "needs" || e.questions.length > 0 || (e.mission && STAGES[e.stage].id === "review"));
   }
 
   private freeSpot(station: StationId, e: Editor): Spot {
@@ -316,12 +621,21 @@ class Store {
     e.model = model;
     e.effort = effort;
     this.lastModel = { model, effort };
+    if (this.live) void this.attempt(() => api("PATCH", `/api/chats/${editorId}`, { model, effort: effort || null }));
     this.emit();
+  }
+
+  setAccount(editorId: string, accountId: string) {
+    void this.attempt(() => api("PATCH", `/api/chats/${editorId}`, { accountId }));
   }
 
   send(editorId: string, text: string, attachments: Attachment[] = []) {
     const e = this.editors.find((v) => v.id === editorId);
     if (!e || (!text.trim() && !attachments.length)) return;
+    if (this.live) {
+      void this.attempt(() => api("POST", `/api/chats/${editorId}/messages`, { text, attachments: attachments.map((a) => ({ hash: a.hash, role: a.role })) }));
+      return;
+    }
     e.messages.push({ id: uid(), from: "user", text, attachments });
     const footage = attachments.find((a) => a.role === "footage");
     const reference = attachments.some((a) => a.role === "reference");
@@ -355,6 +669,12 @@ class Store {
       this.emit();
     }, 1500);
     this.emit();
+  }
+
+  /** Creates the chat with its brief, so the editor never needs to ask about mode or style. */
+  async startVideo(brief: Brief, text: string, files: Attachment[], options: { accountId?: string; model: string; effort: string }) {
+    const view = await this.createChat({ ...options, brief });
+    if (view) this.send(view.id, text, files);
   }
 
   startMission(mission: Mission, why: string, reference?: Attachment, model = this.lastModel) {
@@ -439,6 +759,10 @@ class Store {
       this.emit();
       return;
     }
+    if (this.live && e.status !== "idle") {
+      e.activity = ACTIVITY[e.status];
+      return;
+    }
     if (next === "working") {
       e.activity = "working";
       e.detail = STAGES[e.stage].detail[0];
@@ -472,11 +796,13 @@ class Store {
 
   update(dt: number) {
     this.clock += (THEME_HOURS[this.theme] - this.clock) * Math.min(1, dt * 1.5);
-    const working = this.editors.filter((e) => e.activity === "working").length;
-    this.usage.session = Math.max(0.09, this.usage.session - dt * 0.00003 * working);
-    this.usage.weekly = Math.max(0.09, this.usage.weekly - dt * 0.00001 * working);
-    this.usage.fable = Math.max(0.09, this.usage.fable - dt * 0.000006 * working);
-    this.usage.sessionResetMin = Math.max(1, this.usage.sessionResetMin - dt / 60);
+    if (!this.live) {
+      const working = this.editors.filter((e) => e.activity === "working").length;
+      this.usage.session = Math.max(0.09, this.usage.session - dt * 0.00003 * working);
+      this.usage.weekly = Math.max(0.09, this.usage.weekly - dt * 0.00001 * working);
+      this.usage.fable = Math.max(0.09, this.usage.fable - dt * 0.000006 * working);
+      this.usage.sessionResetMin = Math.max(1, this.usage.sessionResetMin - dt / 60);
+    }
 
     this.updateBoat(dt);
     for (const e of this.editors) this.updateEditor(e, dt);
@@ -555,6 +881,11 @@ class Store {
     }
 
     const stage = STAGES[e.stage];
+    if (this.live && e.status !== "idle") {
+      e.pose = { working: POSE[e.station] ?? "type", thinking: "think", needs: "hand", stuck: "slump", resting: "sleep" }[e.status] as Pose;
+      if (e.status === "needs") e.face = "down";
+      return;
+    }
     switch (e.activity) {
       case "working": {
         if (stage.id === "review") {
@@ -636,7 +967,7 @@ class Store {
             e.activity = "waiting";
             e.detail = "Ready for review";
             e.timer = 9999;
-            e.messages.push({ id: uid(), from: "editor", text: "First cut is ready. I made 4 small calls, and they're all in your Review list." });
+            if (!this.live) e.messages.push({ id: uid(), from: "editor", text: "First cut is ready. I made 4 small calls, and they're all in your Review list." });
           } else {
             e.activity = "waiting";
             e.timer = 0;

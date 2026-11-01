@@ -26,7 +26,7 @@ struct StudioWebView: NSViewRepresentable {
 
     func updateNSView(_ view: WKWebView, context: Context) {}
 
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
         private let address: URL
 
         init(address: URL) {
@@ -43,11 +43,23 @@ struct StudioWebView: NSViewRepresentable {
 
         /// Anything that isn't the studio opens in the user's own browser.
         func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            if action.shouldPerformDownload { return decisionHandler(.download) }
             guard let url = action.request.url, url.host != address.host, url.scheme != "blob", url.scheme != "data" else {
                 return decisionHandler(.allow)
             }
             NSWorkspace.shared.open(url)
             decisionHandler(.cancel)
+        }
+
+        func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+            download.delegate = self
+        }
+
+        /// Saving a render asks where to put it, like any Mac app.
+        func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
+            let panel = NSSavePanel()
+            panel.nameFieldStringValue = suggestedFilename
+            panel.begin { result in completionHandler(result == .OK ? panel.url : nil) }
         }
 
         /// Set DOJO_SNAPSHOT to a path to save a screenshot and quit. Used to test release builds.

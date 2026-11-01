@@ -10,6 +10,9 @@ struct ShifuDojoApp: App {
         WindowGroup("Shifu Dojo") {
             ContentView(studio: studio)
                 .frame(minWidth: 1100, minHeight: 720)
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+                    studio.stop()
+                }
         }
         .defaultSize(width: 1440, height: 900)
         .commands {

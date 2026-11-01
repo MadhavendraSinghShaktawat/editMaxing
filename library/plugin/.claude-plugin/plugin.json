@@ -1,0 +1,8 @@
+{
+  "name": "shifu-dojo",
+  "displayName": "Shifu Dojo",
+  "version": "0.1.0",
+  "description": "Video editing skills for Shifu Dojo editors: the five-stage edit, B-roll direction, motion graphics, sound and hearing.",
+  "author": { "name": "Social Shifu" },
+  "license": "MIT"
+}
