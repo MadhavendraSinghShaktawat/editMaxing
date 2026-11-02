@@ -3,10 +3,29 @@ import { lowerBound } from "./lib/dsa.ts";
 
 export type Word = { i: number; t0: number; t1: number; text: string };
 
-export type Overlay = { id: string; from: number; to: number; path: string; in: number; label?: string; shotId?: string };
+export type Entrance = { kind: "none" | "fade" | "slide_up" | "slide_down" | "slide_left" | "slide_right" | "pop"; seconds: number };
+/** A place in the frame, as fractions of its width and height. */
+export type Box = { x: number; y: number; w: number; h: number };
+export type CameraKind = "push_in" | "pull_out" | "punch_in" | "pan_left" | "pan_right" | "pan_up" | "pan_down" | "shake";
+export type Ease = "smooth" | "snap" | "linear";
+export type Overlay = { id: string; from: number; to: number; path: string; in: number; label?: string; shotId?: string; enter?: Entrance; exit?: Entrance; box?: Box; speed?: number; move?: { kind: CameraKind; amount: number }; hideCaptions?: boolean };
+export type Move = { id: string; from: number; to: number; kind: CameraKind; amount: number; ease: Ease; x: number; y: number };
+export type TransitionKind = "fade" | "dissolve" | "dip_black" | "dip_white" | "slide_left" | "slide_right" | "slide_up" | "slide_down" | "smooth_left" | "smooth_right" | "zoom_in" | "blur" | "circle" | "whip_left" | "whip_right";
+export type Transition = { id: string; word: number; kind: TransitionKind; seconds: number };
+export type Card = { id: string; from: number; to: number; color: string; label?: string };
+export type EffectKind = "flash" | "blur" | "rgb_split" | "grain";
+export type Effect = { id: string; from: number; to: number; kind: EffectKind; amount: number };
+export type Emphasis = { word: number; scale?: number; font?: string; color?: string; breakBefore?: boolean; x?: number; y?: number };
+/** Words waiting for a clip from the Motion agent. A final render can't start until it lands. */
+export type Reserved = { id: string; from: number; to: number; label: string };
 export type Sfx = { id: string; word: number; offset: number; path: string; gainDb: number; label?: string };
 export type Music = { id: string; path: string; gainDb: number; duck: boolean; label?: string };
-export type CaptionStyle = { enabled: boolean; maxWords: number; uppercase: boolean; font: string; size: number | null; color: string; highlight: string; position: number };
+export type CaptionAnimation = "none" | "fade" | "pop" | "rise" | "drop" | "stretch";
+export type CaptionStyle = {
+  enabled: boolean; maxWords: number; uppercase: boolean; font: string; size: number | null; color: string; highlight: string; position: number;
+  x?: number; strokeColor?: string; strokeWidth?: number; glowColor?: string; glowRadius?: number; boxColor?: string; boxOpacity?: number;
+  animation?: CaptionAnimation; animationSeconds?: number; reveal?: "chunk" | "word"; lineHeight?: number; maxWidth?: number;
+};
 
 export type EditDoc = {
   source: { hash: string; path: string; name: string; duration: number; width: number; height: number; fps: number; locale: string };
@@ -20,19 +39,35 @@ export type EditDoc = {
   captions: CaptionStyle;
   sfx: Sfx[];
   music: Music[];
+  moves: Move[];
+  transitions: Transition[];
+  cards: Card[];
+  effects: Effect[];
+  emphasis: Emphasis[];
+  reserved: Reserved[];
 };
+
+/** Versions saved before these layers existed still open. */
+export const withLayers = (doc: EditDoc): EditDoc => ({ ...doc, moves: doc.moves ?? [], transitions: doc.transitions ?? [], cards: doc.cards ?? [], effects: doc.effects ?? [], emphasis: doc.emphasis ?? [], reserved: doc.reserved ?? [] });
 
 export type Op =
   | { op: "remove_words"; from: number; to: number; reason?: string }
   | { op: "restore_words"; from: number; to: number }
   | { op: "set_max_pause"; seconds: number | null }
   | { op: "keep_pause"; word: number }
-  | { op: "add_broll"; from: number; to: number; path: string; in?: number; label?: string; shotId?: string }
-  | { op: "add_graphic"; from: number; to: number; path: string; label?: string }
+  | { op: "add_broll"; from: number; to: number; path: string; in?: number; label?: string; shotId?: string; enter?: Entrance; exit?: Entrance; box?: Box; speed?: number; move?: { kind: CameraKind; amount: number } }
+  | { op: "add_graphic"; from: number; to: number; path: string; label?: string; enter?: Entrance; exit?: Entrance; box?: Box; reservation?: string; hideCaptions?: boolean }
+  | { op: "reserve_graphic"; from: number; to: number; label: string; id: string }
+  | { op: "add_move"; from: number; to: number; kind: CameraKind; amount?: number; ease?: Ease; x?: number; y?: number }
+  | { op: "add_transition"; word: number; kind: TransitionKind; seconds?: number }
+  | { op: "add_card"; from: number; to: number; color: string; label?: string }
+  | { op: "add_effect"; from: number; to: number; kind: EffectKind; amount?: number }
+  | { op: "style_words"; from: number; to: number; scale?: number; font?: string; color?: string; breakBefore?: boolean; x?: number; y?: number }
+  | { op: "clear_word_styles"; from: number; to: number }
   | { op: "add_sfx"; word: number; path: string; offset?: number; gainDb?: number; label?: string }
   | { op: "add_music"; path: string; gainDb?: number; duck?: boolean; label?: string }
   | { op: "remove_item"; id: string }
-  | { op: "set_captions"; enabled?: boolean; maxWords?: number; uppercase?: boolean; font?: string; size?: number; color?: string; highlight?: string; position?: number }
+  | ({ op: "set_captions" } & Partial<Omit<CaptionStyle, "size"> & { size: number }>)
   | { op: "set_output"; width: number; height: number };
 
 export function newDoc(source: EditDoc["source"], words: { text: string; start: number; end: number }[]): EditDoc {
@@ -45,9 +80,15 @@ export function newDoc(source: EditDoc["source"], words: { text: string; start: 
     keepPauses: [],
     broll: [],
     graphics: [],
-    captions: { enabled: false, maxWords: 4, uppercase: false, font: "Avenir Next Heavy", size: null, color: "#FFFFFF", highlight: "#FFD34E", position: 0.14 },
+    captions: { enabled: false, maxWords: 4, uppercase: false, font: "Avenir Next Heavy", size: null, color: "#FFFFFF", highlight: "#FFD34E", position: 0.14, strokeWidth: 8, animation: "pop", reveal: "chunk" },
     sfx: [],
     music: [],
+    moves: [],
+    transitions: [],
+    cards: [],
+    effects: [],
+    emphasis: [],
+    reserved: [],
   };
 }
 
@@ -79,7 +120,8 @@ const check = (ok: boolean, message: string) => {
 };
 
 export function applyOps(doc: EditDoc, ops: Op[]) {
-  const d: EditDoc = structuredClone(doc);
+  const d: EditDoc = structuredClone(withLayers(doc));
+  const added: Transition[] = [];
   const file = (o: { path?: string }) => check(typeof o.path === "string" && o.path.length > 0, "This edit needs a file path.");
   const n = d.words.length;
   const range = (from: number, to: number) => check(Number.isInteger(from) && Number.isInteger(to) && from >= 0 && to < n && from <= to, `Word range ${from}-${to} is outside 0-${n - 1}.`);
@@ -106,14 +148,60 @@ export function applyOps(doc: EditDoc, ops: Op[]) {
         range(o.from, o.to);
         const clash = d.broll.find((b) => o.from <= b.to && b.from <= o.to);
         check(!clash, `That overlaps B-roll "${clash?.label ?? clash?.id}" on words ${clash?.from}-${clash?.to}.`);
-        d.broll.push({ id: randomUUID().slice(0, 8), from: o.from, to: o.to, path: o.path, in: o.in ?? 0, label: o.label, shotId: o.shotId });
+        check(o.speed === undefined || (o.speed >= 0.1 && o.speed <= 8), "B-roll speed must be between 0.1 and 8.");
+        d.broll.push({ id: randomUUID().slice(0, 8), from: o.from, to: o.to, path: o.path, in: o.in ?? 0, label: o.label, shotId: o.shotId, enter: o.enter, exit: o.exit, box: o.box, speed: o.speed, move: o.move });
         d.broll.sort((a, b) => a.from - b.from);
         break;
       }
       case "add_graphic":
         file(o);
         range(o.from, o.to);
-        d.graphics.push({ id: randomUUID().slice(0, 8), from: o.from, to: o.to, path: o.path, in: 0, label: o.label });
+        d.graphics.push({ id: randomUUID().slice(0, 8), from: o.from, to: o.to, path: o.path, in: 0, label: o.label, enter: o.enter, exit: o.exit, box: o.box, hideCaptions: o.hideCaptions });
+        if (o.reservation) d.reserved = d.reserved.filter((r) => r.id !== o.reservation);
+        break;
+      case "reserve_graphic":
+        range(o.from, o.to);
+        d.reserved.push({ id: o.id, from: o.from, to: o.to, label: o.label });
+        break;
+      case "add_move":
+        range(o.from, o.to);
+        d.moves.push({ id: randomUUID().slice(0, 8), from: o.from, to: o.to, kind: o.kind, amount: o.amount ?? 0.08, ease: o.ease ?? "smooth", x: o.x ?? 0.5, y: o.y ?? 0.5 });
+        d.moves.sort((a, b) => a.from - b.from);
+        break;
+      case "add_transition": {
+        range(o.word, o.word);
+        const t = { id: randomUUID().slice(0, 8), word: o.word, kind: o.kind, seconds: o.seconds ?? 0.3 };
+        check(t.seconds >= 0.04 && t.seconds <= 2, "A transition must last between 0.04 and 2 seconds.");
+        d.transitions = d.transitions.filter((v) => v.word !== o.word);
+        d.transitions.push(t);
+        added.push(t);
+        break;
+      }
+      case "add_card":
+        range(o.from, o.to);
+        check(/^#[0-9a-fA-F]{6}$/.test(o.color), "A card colour must look like #000000.");
+        d.cards.push({ id: randomUUID().slice(0, 8), from: o.from, to: o.to, color: o.color, label: o.label });
+        break;
+      case "add_effect":
+        range(o.from, o.to);
+        d.effects.push({ id: randomUUID().slice(0, 8), from: o.from, to: o.to, kind: o.kind, amount: o.amount ?? 1 });
+        break;
+      case "style_words": {
+        range(o.from, o.to);
+        const { op: _, from, to, ...style } = o;
+        for (let word = from; word <= to; word++) {
+          const current = d.emphasis.find((e) => e.word === word);
+          // Position and line breaks belong to the first word of a run, or every word would stack.
+          const own = word === from ? style : { scale: style.scale, font: style.font, color: style.color };
+          const clean = Object.fromEntries(Object.entries(own).filter(([, v]) => v !== undefined));
+          if (current) Object.assign(current, clean);
+          else d.emphasis.push({ word, ...clean });
+        }
+        break;
+      }
+      case "clear_word_styles":
+        range(o.from, o.to);
+        d.emphasis = d.emphasis.filter((e) => e.word < o.from || e.word > o.to);
         break;
       case "add_sfx":
         file(o);
@@ -125,12 +213,18 @@ export function applyOps(doc: EditDoc, ops: Op[]) {
         d.music.push({ id: randomUUID().slice(0, 8), path: o.path, gainDb: o.gainDb ?? -20, duck: o.duck ?? true, label: o.label });
         break;
       case "remove_item": {
-        const before = d.broll.length + d.graphics.length + d.sfx.length + d.music.length;
+        const count = () => d.broll.length + d.graphics.length + d.sfx.length + d.music.length + d.moves.length + d.transitions.length + d.cards.length + d.effects.length + d.reserved.length;
+        const before = count();
         d.broll = d.broll.filter((v) => v.id !== o.id);
         d.graphics = d.graphics.filter((v) => v.id !== o.id);
         d.sfx = d.sfx.filter((v) => v.id !== o.id);
         d.music = d.music.filter((v) => v.id !== o.id);
-        check(before !== d.broll.length + d.graphics.length + d.sfx.length + d.music.length, `Nothing has the id ${o.id}.`);
+        d.moves = d.moves.filter((v) => v.id !== o.id);
+        d.transitions = d.transitions.filter((v) => v.id !== o.id);
+        d.cards = d.cards.filter((v) => v.id !== o.id);
+        d.effects = d.effects.filter((v) => v.id !== o.id);
+        d.reserved = d.reserved.filter((v) => v.id !== o.id);
+        check(before !== count(), `Nothing has the id ${o.id}.`);
         break;
       }
       case "set_captions": {
@@ -146,6 +240,11 @@ export function applyOps(doc: EditDoc, ops: Op[]) {
       default:
         throw new Error(`Unknown edit: ${(o as { op: string }).op}`);
     }
+  }
+  if (added.length) {
+    const segs = segments(d);
+    const joins = joinWords(d, segs);
+    for (const t of added) check(joins.includes(t.word), `Word ${t.word} doesn't sit on a cut. A transition needs a cut. Cuts are before words: ${joins.slice(0, 40).join(", ") || "none yet"}.`);
   }
   return d;
 }
@@ -203,6 +302,14 @@ export function segments(doc: EditDoc): Segment[] {
   return out.filter((s) => s.end - s.start > 0.001);
 }
 
+/** The first kept word after each cut. Transitions anchor here. */
+export function joinWords(doc: EditDoc, segs: Segment[]) {
+  return doc.words.filter((w) => !isRemoved(doc, w.i)).filter((w) => {
+    const t = toOutput(segs, w.t0);
+    return segs.some((s, i) => i > 0 && Math.abs(s.outStart - t) < 0.15);
+  }).filter((w, i, all) => i === 0 || toOutput(segs, w.t0) - toOutput(segs, all[i - 1].t0) > 0.15).map((w) => w.i);
+}
+
 export const totalDuration = (segs: Segment[]) => (segs.length ? segs[segs.length - 1].outStart + segs[segs.length - 1].end - segs[segs.length - 1].start : 0);
 
 /** Maps a source time to output time in O(log n). Times inside a cut snap to the next kept moment. */
@@ -220,19 +327,30 @@ export function wordSpan(doc: EditDoc, segs: Segment[], from: number, to: number
   return { start: toOutput(segs, doc.words[from].t0), end: toOutput(segs, doc.words[to].t1) };
 }
 
+type CaptionWord = { text: string; start: number; end: number; scale?: number; font?: string; color?: string; breakBefore?: boolean };
+
 export function captionChunks(doc: EditDoc, segs: Segment[]) {
-  const chunks: { start: number; end: number; words: { text: string; start: number; end: number }[] }[] = [];
-  let cur: { start: number; end: number; words: { text: string; start: number; end: number }[] } | null = null;
+  const chunks: { start: number; end: number; words: CaptionWord[]; x?: number; y?: number }[] = [];
+  let cur: (typeof chunks)[number] | null = null;
+  const styled = new Map((doc.emphasis ?? []).map((e) => [e.word, e]));
+  // A graphic that carries its own words would otherwise show them twice.
+  const quiet = doc.graphics.filter((g) => g.hideCaptions);
   for (const w of doc.words) {
-    if (isRemoved(doc, w.i)) continue;
+    if (isRemoved(doc, w.i) || quiet.some((g) => w.i >= g.from && w.i <= g.to)) continue;
     const start = toOutput(segs, w.t0);
     const end = toOutput(segs, w.t1);
-    const breakHere = cur && (cur.words.length >= doc.captions.maxWords || start - cur.end > 0.45 || /[.?!]$/.test(cur.words[cur.words.length - 1].text));
+    const style = styled.get(w.i);
+    const moved = style?.x !== undefined || style?.y !== undefined;
+    const breakHere = cur && (cur.words.length >= doc.captions.maxWords || start - cur.end > 0.45 || /[.?!]$/.test(cur.words[cur.words.length - 1].text) || moved);
     if (!cur || breakHere) {
       if (cur) chunks.push(cur);
       cur = { start, end, words: [] };
+      if (moved) {
+        cur.x = style?.x;
+        cur.y = style?.y;
+      }
     }
-    cur.words.push({ text: w.text, start, end });
+    cur.words.push({ text: w.text, start, end, ...(style ? { scale: style.scale, font: style.font, color: style.color, breakBefore: style.breakBefore } : {}) });
     cur.end = end;
   }
   if (cur) chunks.push(cur);

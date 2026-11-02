@@ -17,8 +17,11 @@ export const DIRS = {
   cache: join(HOME, "cache"),
   library: join(HOME, "library"),
   tmp: join(HOME, "tmp"),
+  styles: join(HOME, "styles"),
 };
 
+/** Styles the maintainers have chosen to share with everyone. Empty until one is added. */
+export const SHARED_STYLES = process.env.DOJO_SHARED_STYLES ?? join(ROOT, "library/styles");
 export const PLUGIN_DIR = process.env.DOJO_PLUGIN ?? join(ROOT, "library/plugin");
 export const MOTION_MODULES = join(DIRS.packs, "motion/node_modules");
 export const MOTION_PYTHON = join(DIRS.packs, "motion/.venv/bin");

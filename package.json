@@ -8,7 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "engine": "node --disable-warning=ExperimentalWarning engine/src/main.ts",
-    "test": "node --disable-warning=ExperimentalWarning --test engine/test/*.test.ts"
+    "test": "node --disable-warning=ExperimentalWarning --test engine/test/*.test.ts",
+    "style": "node --disable-warning=ExperimentalWarning scripts/style.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.316",

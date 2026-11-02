@@ -61,14 +61,16 @@ private func register(_ from: Small, _ to: Small) -> [String: Double]? {
     scale /= 4
     turn /= 4
 
-    // Vision's origin is bottom-left and the transform carries the target onto the reference.
+    // The warp carries `from` onto `to`, so scoring a pixel of `to` walks it back through the inverse.
+    // Vision's origin is bottom-left.
+    let back = warp.inverse
     var before = 0
     var after = 0
     var count = 0
     let stride = max(2, to.width / 80)
     for y in Swift.stride(from: stride, to: to.height - stride, by: stride) {
         for x in Swift.stride(from: stride, to: to.width - stride, by: stride) {
-            let q = apply(warp, Float(x), Float(to.height - 1 - y))
+            let q = apply(back, Float(x), Float(to.height - 1 - y))
             let qx = Int(q.x.rounded())
             let qy = from.height - 1 - Int(q.y.rounded())
             guard qx >= 0, qy >= 0, qx < from.width, qy < from.height else { continue }
@@ -80,7 +82,7 @@ private func register(_ from: Small, _ to: Small) -> [String: Double]? {
     }
     guard count > 20 else { return nil }
     return [
-        "scale": Double(1 / max(scale, 0.01)),
+        "scale": Double(scale),
         "dx": Double(-shift.x / w),
         "dy": Double(shift.y / h),
         "turn": Double(-turn),

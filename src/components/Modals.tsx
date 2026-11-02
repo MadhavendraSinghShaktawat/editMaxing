@@ -1,7 +1,7 @@
 import { ReactNode, useEffect, useState } from "react";
 import { LogOut, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { TOOLS } from "../sim/data";
-import { Job, StoredFile, api, resetLabel, uploadFile } from "../sim/engine";
+import { Job, STYLE_AREAS, StoredFile, StyleRule, api, resetLabel, uploadFile } from "../sim/engine";
 import { store, useStore } from "../sim/store";
 import { AttachmentStrip, formatTime, useAttachments } from "./Attach";
 import { BoardId } from "./Hud";
@@ -313,6 +313,20 @@ export function Accounts({ onClose }: { onClose: () => void }) {
   );
 }
 
+function RuleList({ rules }: { rules?: StyleRule[] }) {
+  if (!rules?.length) return null;
+  return (
+    <div className="rule-list">
+      {rules.map((r) => (
+        <div key={r.rule} className="rule">
+          <span>{r.rule}</span>
+          {r.evidence && <small>{r.evidence.map((e) => formatTime(e.at)).join(", ")}{r.confidence ? ` · ${r.confidence}` : ""}</small>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function StylesBoard() {
   const s = useStore();
   const [open, setOpen] = useState<string | null>(null);
@@ -329,21 +343,21 @@ function StylesBoard() {
     return (
       <div className="style-detail">
         <button className="back" onClick={() => setOpen(null)}>Back to styles</button>
-        <h3>{shown.name} {shown.status === "draft" && <em>Draft</em>}</h3>
+        <h3>{shown.name} {shown.status === "draft" && <em>Draft</em>}{shown.shared && <em>Shared{shown.author ? ` by ${shown.author}` : ""}</em>}</h3>
         <p className="lede">{shown.card.summary}</p>
         {shown.card.structure && <p>{shown.card.structure}</p>}
-        <div className="rule-list">
-          {shown.card.rules?.map((r) => (
-            <div key={r.rule} className="rule">
-              <span>{r.rule}</span>
-              {r.evidence && <small>{r.evidence.map((e) => formatTime(e.at)).join(", ")}{r.confidence ? ` · ${r.confidence}` : ""}</small>}
-            </div>
-          ))}
-        </div>
+        {STYLE_AREAS.some(([id]) => shown.card[id]?.summary) ? STYLE_AREAS.filter(([id]) => shown.card[id]?.summary).map(([id, label]) => (
+          <section key={id}>
+            <h3>{label}</h3>
+            <p className="lede">{shown.card[id]!.summary}</p>
+            <RuleList rules={shown.card[id]!.rules} />
+          </section>
+        )) : <RuleList rules={shown.card.rules} />}
+        {!!shown.card.anyPerson?.length && <><h3>On someone else's footage</h3>{shown.card.anyPerson.map((u) => <p key={u} className="lede">{u}</p>)}</>}
         {!!shown.card.unsure?.length && <><h3>What Claude couldn't confirm</h3>{shown.card.unsure.map((u) => <p key={u} className="lede">{u}</p>)}</>}
         {!!shown.card.rejected?.length && <><h3>Rules dropped by the evidence check</h3>{shown.card.rejected.map((u) => <p key={u.rule} className="lede">{u.rule}: {u.reason}</p>)}</>}
         <div className="flow-foot">
-          <button className="ghost-btn" onClick={() => { void s.attempt(() => api("DELETE", `/api/styles/${shown.id}`)); setOpen(null); }}>Delete</button>
+          {!shown.shared && <button className="ghost-btn" onClick={() => { void s.attempt(() => api("DELETE", `/api/styles/${shown.id}`)); setOpen(null); }}>Delete</button>}
           {shown.status === "draft" && <button className="primary" onClick={() => void s.attempt(() => api("PATCH", `/api/styles/${shown.id}`, { status: "approved" }))}>Approve this style</button>}
         </div>
       </div>
@@ -351,7 +365,7 @@ function StylesBoard() {
   }
   return (
     <>
-      <p className="lede">Your saved looks and editing styles. Add a reference video and Claude studies it once. Nothing goes live until you approve it.</p>
+      <p className="lede">{s.styles.length ? "Your saved editing styles. Add a reference video and Claude studies it once. Nothing goes live until you approve it." : "No styles yet. They're all yours to make: add a reference video and Claude studies it. Nothing goes live until you approve it."}</p>
       {running && <JobLine job={running} />}
       <div className="board-grid">
         {s.styles.map((c) => (
@@ -362,7 +376,7 @@ function StylesBoard() {
               ))}
             </span>
             <b>{c.name}</b>
-            <small>{c.status === "draft" ? "Draft, needs approval" : (s.modes.find((m) => m.id === c.mode)?.label ?? "Any video")}</small>
+            <small>{c.status === "draft" ? "Draft, needs approval" : c.shared ? `Shared${c.author ? ` by ${c.author}` : ""}` : (s.modes.find((m) => m.id === c.mode)?.label ?? "Any video")}</small>
             <p>{c.card.summary}</p>
           </button>
         ))}

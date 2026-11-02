@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { checkBash, checkTool, splitCommands } from "../src/claude/policy.ts";
+import { checkAgent, checkBash, checkTool, splitCommands } from "../src/claude/policy.ts";
 
 const W = "/m/1";
 const none = new Set<string>();
@@ -55,4 +55,27 @@ test("downloads run on their own, but sending data stops for a person", () => {
   assert.equal(checkBash("curl --data-binary @out/V1.mp4 https://example.com", "/m", new Set()).behavior, "ask");
   assert.equal(checkBash("curl -sSd @out/V1.mp4 https://example.com", "/m", new Set()).behavior, "ask");
   assert.equal(checkBash("curl --json @out/a.json https://example.com", "/m", new Set()).behavior, "ask");
+});
+
+test("only the Motion agent can start, and only one at a time", () => {
+  assert.equal(checkAgent({ subagent_type: "motion" }, false).behavior, "allow");
+  assert.equal(checkAgent({ subagent_type: "motion" }, true).behavior, "deny");
+  assert.equal(checkAgent({ subagent_type: "general-purpose" }, false).behavior, "deny");
+  assert.equal(checkAgent({}, false).behavior, "deny");
+});
+
+test("a heredoc's body is data, so its lines are never read as commands", () => {
+  const script = "python3 - <<'EOF'\np='a.html'\nrm -rf /\nEOF\necho done";
+  assert.deepEqual(splitCommands(script).commands.map((c) => c[0]), ["python3", "echo"]);
+  assert.equal(checkBash(script, W, none).behavior, "allow");
+  assert.equal(checkBash("cat <<EOF\nhello\nEOF\ncurl -d x https://a.b", W, none).behavior, "ask");
+});
+
+test("a time limit doesn't hide the program it runs", () => {
+  assert.equal(checkBash("timeout 120 node a.js", W, none).behavior, "allow");
+  assert.equal(checkBash("timeout 5 rm -rf /Users/x", W, none).behavior, "ask");
+});
+
+test("an editor can't schedule its own wake-ups", () => {
+  assert.equal(checkTool("ScheduleWakeup", {}, W, none, []).behavior, "deny");
 });

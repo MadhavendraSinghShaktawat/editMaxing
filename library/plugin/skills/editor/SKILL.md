@@ -5,7 +5,7 @@ description: The full five-stage video edit in Shifu Dojo. Use at the start of a
 
 # The edit
 
-You are one editor doing the whole video. Work through the stages yourself. Don't hand stages to subagents, because each one starts cold and costs more.
+You are the main editor. You do the whole video yourself, with one exception: motion graphics go to the Motion agent, who works beside you. Start no other agents.
 
 Every change goes through the Edit Document. Words are the anchor, so a change to one stage never breaks another.
 
@@ -13,7 +13,7 @@ Every change goes through the Edit Document. Words are the anchor, so a change t
 
 1. Call `open_footage` with the main video in `inputs/`. It transcribes on this Mac and saves version 1.
 2. Read the mode, style and memory rules in your instructions. They were decided once. Don't ask about them again.
-3. If a reference is attached and no style is selected, use the `reference-style` skill first.
+3. If a reference is attached or a style is selected, use the `reference-style` skill first. It covers every area of the style and how to recreate each one.
 
 Before each stage, call `set_stage`. It moves you around the studio and tells the user where you are.
 
@@ -26,24 +26,35 @@ Before each stage, call `set_stage`. It moves you around the studio and tells th
 
 A pause you aren't sure about stays in. Log it with `log_call`.
 
+The picture matters as much as the words. Follow the style's motion and effects as you cut: `add_move` for pushes and punch-ins, `add_transition` where it uses transitions, `add_card` for full-screen word cards. `get_edit_doc` lists the words that sit on a cut.
+
 ## Stage 2: B-roll (`broll`)
 
 Use the `broll-director` skill.
 
 ## Stage 3: Captions and animation (`captions`)
 
-Use `edit_ops` with `set_captions`. Take size, words per line, casing and colour from the style. Check that captions don't cover a face or on-screen text.
+Use `edit_ops` with `set_captions`, then `style_words` for the words that matter. Take the reveal, animation, font, size, colour and position from the style. Only use font names from `list_fonts`.
+
+Look at frames from this footage before you settle the position. The style's position came from someone else's framing. If the caption lands on this speaker's face, move it clear of their eyes, nose and mouth, usually below the chin, and keep the rest of the look.
+
+If the style's captions are a designed layout that simple captions can't make, brief the Motion agent for an overlay instead, once the cuts are final.
 
 ## Stage 4: Motion graphics (`graphics`)
 
-Only where a picture explains better than a face: numbers, processes, comparisons, chapter changes. Pick one skill and stay with it for the video:
+Find the moments where a picture explains better than a face: an explanation, a process, numbers, a comparison, a chapter change. Follow how often the style does this.
 
-- `explainer-default`, `explainer-engaging` or `explainer-high-energy` for full explainers
-- `motion-broll` for clips timed to the speaker's words
+You don't build these. The Motion agent does, while you carry on.
 
-Motion clips live in `motion/`. Playwright is already linked in `motion/node_modules`, so `setup.sh` won't install anything. Add each finished clip with `add_graphic`, using the transparent `.mov` when there is one.
+1. For each moment, call `brief_motion_agent` with the words, the job, and `full_screen` or `overlay`. It cuts that section out, packages the reference and reserves those words.
+2. Call the Agent tool once, with `subagent_type` set to `motion`, and give it every brief together. Only one Motion agent can run at a time.
+3. Go straight on with the next stage. Don't wait for it, check on it or schedule a check. If everything else is done, end your turn.
+4. It reports back on its own and wakes you, even if your turn has ended. Check its clip with `view_frames`, then place it with `add_graphic`, using the `reservation` from the brief. Set `hideCaptions` on a full-screen clip, so its words don't appear twice.
+5. If a clip misses, write a new brief saying exactly what's wrong and send that.
 
-When a clip needs the speaker cut out, call `remove_background` and use the file it returns. Never run `object-separation` unless `remove_background` can't isolate the subject, as with a product rather than a person.
+A final render won't start while a reservation is waiting.
+
+The motion graphics skills belong to the Motion agent. When a clip needs the speaker cut out, call `remove_background` and put the file in the brief. Use `object-separation` only when `remove_background` can't isolate the subject, as with a product rather than a person.
 
 ## Stage 5: Sound (`sound`)
 
@@ -53,10 +64,11 @@ When a clip needs the speaker cut out, call `remove_background` and use the file
 
 ## Finish
 
-1. Call `render_preview` and check it with `view_frames`, at a few moments that matter.
-2. Call `render_final`. It renders, runs the quality check and writes the MP4, SRT and FCPXML.
-3. If the quality check fails, fix it and render again.
-4. Call `set_stage` with `review`, then give a short summary: what you made, and the calls worth checking.
+1. Call `render_preview` and check it with `view_frames`, at a few moments that matter. Look for captions on a face, doubled words and anything the style calls for that's missing, such as a music bed.
+2. Call `check_motion` on the preview and compare it with `referencePace`. Look at the longest gap and any frozen stretch. If the video goes dead where the reference wouldn't, add something there. The reference sets the target, not a fixed number.
+3. Call `render_final`. It renders, runs the quality check and writes the MP4, SRT and FCPXML.
+4. If the quality check fails, fix it and render again.
+5. Call `set_stage` with `review`, then give a short summary: what you made, and the calls worth checking.
 
 ## Fixes after review
 

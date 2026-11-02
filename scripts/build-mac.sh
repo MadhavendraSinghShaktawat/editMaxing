@@ -23,6 +23,7 @@ cp -R dist "$APP/Contents/Resources/dist"
 mkdir -p "$APP/Contents/Resources/engine" "$APP/Contents/Resources/library"
 cp -R engine/src "$APP/Contents/Resources/engine/src"
 cp -R library/plugin "$APP/Contents/Resources/library/plugin"
+cp -R library/styles "$APP/Contents/Resources/library/styles"
 
 # Production dependencies only. Chats use the Mac's own claude binary, so the SDK's optional 300 MB copy stays out.
 DEPS="$(mktemp -d)"

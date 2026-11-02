@@ -99,3 +99,84 @@ test("an edit with no file is refused instead of failing later at render", () =>
   const doc = newDoc({ hash: "h", path: "/a.mp4", name: "a", duration: 2, width: 100, height: 100, fps: 30, locale: "en-US" }, [{ text: "hi", start: 0, end: 1 }]);
   assert.throws(() => applyOps(doc, [{ op: "add_sfx", word: 0 } as never]), /file path/);
 });
+
+const cutDoc = () => applyOps(newDoc(source, "one two three four five six seven eight".split(" ").map((text, i) => ({ text, start: i, end: i + 0.8 }))), [{ op: "remove_words", from: 3, to: 4 }]);
+
+test("a transition keeps the length, so nothing anchored to a word moves", () => {
+  const before = cutDoc();
+  const after = applyOps(before, [{ op: "add_transition", word: 5, kind: "dissolve", seconds: 0.4 }]);
+  const a = compile(before, { output: "/o.mp4" });
+  const b = compile(after, { output: "/o.mp4" });
+  assert.equal(b.duration, a.duration);
+  const graph = b.args[b.args.indexOf("-filter_complex") + 1];
+  const offset = Number(graph.match(/xfade=transition=dissolve:duration=0\.400:offset=([\d.]+)/)![1]);
+  const join = segments(after)[1].outStart;
+  assert.ok(Math.abs(offset + 0.2 - join) < 0.01, `transition centres on the cut, ${offset} and ${join}`);
+});
+
+test("a transition must sit on a cut, and says where the cuts are", () => {
+  assert.throws(() => applyOps(cutDoc(), [{ op: "add_transition", word: 1, kind: "fade" }]), /Cuts are before words: 5/);
+});
+
+test("a later cut that removes a transition's word drops it instead of breaking the render", () => {
+  const d = applyOps(applyOps(cutDoc(), [{ op: "add_transition", word: 5, kind: "fade", seconds: 0.2 }]), [{ op: "remove_words", from: 5, to: 5 }]);
+  assert.equal(compile(d, { output: "/o.mp4" }).dropped, 1);
+});
+
+test("a whip uses a directional blur, because tmix turns part of a clip green", () => {
+  const d = applyOps(cutDoc(), [{ op: "add_transition", word: 5, kind: "whip_left" }]);
+  const graph = compile(d, { output: "/o.mp4" }).args.join(" ");
+  assert.match(graph, /avgblur=sizeX=\d+:sizeY=1:enable/);
+  assert.doesNotMatch(graph, /tmix/);
+});
+
+test("camera moves use a sub-pixel warp and only run while they're on screen", () => {
+  const d = applyOps(doc(), [{ op: "add_move", from: 0, to: 2, kind: "push_in", amount: 0.1 }]);
+  const graph = compile(d, { output: "/o.mp4" }).args.join(" ");
+  assert.match(graph, /perspective=x0=.*interpolation=cubic:eval=frame:enable='between\(t,/);
+});
+
+test("every new layer compiles into one graph", () => {
+  const d = applyOps(cutDoc(), [
+    { op: "add_broll", from: 0, to: 1, path: "/b.mp4", enter: { kind: "slide_up", seconds: 0.3 }, exit: { kind: "fade", seconds: 0.2 }, box: { x: 0.5, y: 0.1, w: 0.4, h: 0.4 }, move: { kind: "push_in", amount: 0.1 }, speed: 1.5 },
+    { op: "add_card", from: 2, to: 2, color: "#000000" },
+    { op: "add_effect", from: 5, to: 5, kind: "flash" },
+    { op: "add_effect", from: 6, to: 6, kind: "rgb_split" },
+    { op: "add_graphic", from: 6, to: 7, path: "/g.mov", box: { x: 0.1, y: 0.1, w: 0.5, h: 0.5 }, enter: { kind: "fade", seconds: 0.2 } },
+  ]);
+  const graph = compile(d, { output: "/o.mp4", captionsFile: "/c.mov" }).args[compile(d, { output: "/o.mp4", captionsFile: "/c.mov" }).args.indexOf("-filter_complex") + 1];
+  for (const part of ["drawbox=", "setpts=(PTS-STARTPTS)/1.500", "fade=t=in", "rgbashift", "[cap]overlay"]) assert.ok(graph.includes(part), part);
+});
+
+test("removing any new layer works by id", () => {
+  const d = applyOps(doc(), [{ op: "add_card", from: 1, to: 1, color: "#FFFFFF" }]);
+  assert.equal(applyOps(d, [{ op: "remove_item", id: d.cards[0].id }]).cards.length, 0);
+});
+
+test("styled words reach the captions, and placing a word starts a new block", () => {
+  const d = applyOps(doc(), [{ op: "set_captions", maxWords: 4 }, { op: "style_words", from: 1, to: 1, scale: 2, font: "Didot-Italic" }, { op: "style_words", from: 2, to: 2, y: 0.7 }]);
+  const chunks = captionChunks(d, segments(d));
+  assert.equal(chunks[0].words[1].scale, 2);
+  assert.equal(chunks[0].words[1].font, "Didot-Italic");
+  assert.equal(chunks[1].words[0].text, "three");
+  assert.equal(chunks[1].y, 0.7);
+});
+
+test("a saved version from before these layers still opens", () => {
+  const { moves: _m, transitions: _t, cards: _c, effects: _e, emphasis: _s, reserved: _r, ...old } = doc();
+  assert.equal(compile(old as EditDoc, { output: "/o.mp4" }).dropped, 0);
+  assert.deepEqual(applyOps(old as EditDoc, [{ op: "keep_pause", word: 1 }]).moves, []);
+});
+
+test("a graphic can claim the words reserved for it", () => {
+  const d = applyOps(doc(), [{ op: "reserve_graphic", id: "abc", from: 1, to: 2, label: "A chart" }]);
+  assert.equal(d.reserved.length, 1);
+  assert.equal(applyOps(d, [{ op: "add_graphic", from: 1, to: 2, path: "/g.mov", reservation: "abc" }]).reserved.length, 0);
+});
+
+test("a graphic that shows the words itself turns captions off under it, and only there", () => {
+  const d = applyOps(doc(), [{ op: "set_captions", enabled: true }, { op: "add_graphic", from: 1, to: 2, path: "/g.mp4", hideCaptions: true }]);
+  const shown = captionChunks(d, segments(d)).flatMap((c) => c.words.map((w) => w.text));
+  assert.ok(!shown.includes("two") && !shown.includes("three"));
+  assert.ok(shown.includes("one") && shown.includes("four"));
+});

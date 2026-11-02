@@ -1,0 +1,119 @@
+import { randomUUID } from "node:crypto";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import type { Brief, ChatRow } from "./claude/chat.ts";
+import { findBin } from "./config.ts";
+import { json } from "./db.ts";
+import type { Docs } from "./docs.ts";
+import type { EditDoc } from "./editdoc.ts";
+import { isRemoved, segments, toOutput, wordSpan } from "./editdoc.ts";
+import { run } from "./lib/proc.ts";
+import { findBoundaries, liveliness, readCurve, visualEvents } from "./lib/reference.ts";
+import { probe } from "./lib/media.ts";
+import type { Styles } from "./styles.ts";
+import { STYLE_AREAS } from "./styles.ts";
+
+/** How busy a finished video stays. Reported, never enforced: the reference sets what's right. */
+export async function paceOf(path: string, signal?: AbortSignal) {
+  const info = await probe(path);
+  const curve = await readCurve(path, info.duration, { signal });
+  const boundaries = findBoundaries(curve);
+  return liveliness(curve, visualEvents(curve, boundaries), info.duration);
+}
+
+/** Cuts the kept words of a range out of the source, so the Motion agent sees and hears exactly that part. */
+async function cutClip(doc: EditDoc, from: number, to: number, out: string) {
+  const segs = segments(doc);
+  const { start, end } = wordSpan(doc, segs, from, to);
+  const parts = segs.map((s) => ({ a: Math.max(start, s.outStart), b: Math.min(end, s.outStart + s.end - s.start), s })).filter((p) => p.b - p.a > 0.02);
+  const filters = parts.flatMap((p, i) => {
+    const a = p.s.start + p.a - p.s.outStart;
+    const b = p.s.start + p.b - p.s.outStart;
+    return [`[0:v]trim=${a.toFixed(3)}:${b.toFixed(3)},setpts=PTS-STARTPTS[v${i}]`, `[0:a]atrim=${a.toFixed(3)}:${b.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`];
+  });
+  filters.push(`${parts.map((_, i) => `[v${i}][a${i}]`).join("")}concat=n=${parts.length}:v=1:a=1[v][a]`, `[v]scale=-2:720[small]`);
+  await run(findBin("ffmpeg")!, ["-y", "-loglevel", "error", "-i", doc.source.path, "-filter_complex", filters.join(";"), "-map", "[small]", "-map", "[a]", "-c:v", "h264_videotoolbox", "-b:v", "3000k", "-c:a", "aac", out]);
+  return { start, end };
+}
+
+/** A chat without a saved style can still hand over what it measured from an attached reference. */
+function chatReference(chat: ChatRow, into: string) {
+  const root = join(chat.cwd, "work/reference");
+  if (!existsSync(root)) return null;
+  const newest = readdirSync(root).map((name) => join(root, name)).filter((p) => existsSync(join(p, "facts.json"))).sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0];
+  if (!newest) return null;
+  mkdirSync(into, { recursive: true });
+  const files = readdirSync(newest).filter((f) => /\.(jpg|json)$/.test(f) && !/^f\d+\.jpg$/.test(f));
+  for (const f of files) copyFileSync(join(newest, f), join(into, f));
+  return { files: files.filter((f) => f.endsWith(".jpg")), facts: JSON.parse(readFileSync(join(newest, "facts.json"), "utf8")) as Record<string, unknown>, source: json<{ source?: string }>(existsSync(join(newest, "source.json")) ? readFileSync(join(newest, "source.json"), "utf8") : null, {}).source ?? null };
+}
+
+export type MotionJob = { from: number; to: number; job: string; kind: "full_screen" | "overlay"; notes?: string };
+
+/**
+ * Packages one section for the Motion agent: the cut clip, its words with timing, the output it must
+ * make, and the reference. The agent starts cold, so everything it needs lives in this folder.
+ */
+export async function writeBrief(chat: ChatRow, docs: Docs, styles: Styles, a: MotionJob) {
+  const current = docs.latest(chat.id);
+  if (!current) throw new Error("Open the footage first.");
+  const { doc } = current;
+  const id = randomUUID().slice(0, 8);
+  const rel = `motion/briefs/${id}`;
+  const dir = join(chat.cwd, rel);
+  mkdirSync(dir, { recursive: true });
+  const { start, end } = await cutClip(doc, a.from, a.to, join(dir, "section.mp4"));
+  const segs = segments(doc);
+  const words = doc.words.slice(a.from, a.to + 1).filter((w) => !isRemoved(doc, w.i)).map((w) => ({ text: w.text, start: Number((toOutput(segs, w.t0) - start).toFixed(3)), end: Number((toOutput(segs, w.t1) - start).toFixed(3)) }));
+  const seconds = Number((end - start).toFixed(3));
+  const output = `motion/out/${id}.${a.kind === "overlay" ? "mov" : "mp4"}`;
+  mkdirSync(join(chat.cwd, "motion/out"), { recursive: true });
+
+  const mission = json<Brief>(chat.mission, {});
+  const lines: string[] = [];
+  let referenceNote = "No reference was given for this video. Design it to feel premium, and match the section's own look.";
+  if (mission.styleId) {
+    const pack = styles.referencePack(mission.styleId, join(dir, "reference"));
+    const { measurements, rejected: _rejected, rules: _rules, ...card } = pack.style.card as Record<string, unknown>;
+    writeFileSync(join(dir, "reference/style.json"), JSON.stringify(card, null, 1));
+    writeFileSync(join(dir, "reference/measurements.json"), JSON.stringify(measurements ?? {}, null, 1));
+    lines.push(`Style: ${pack.style.name}. Read reference/style.json and reference/measurements.json.`);
+    for (const area of STYLE_AREAS) {
+      const section = (card as Record<string, { summary?: string } | undefined>)[area.id];
+      if (section?.summary) lines.push(`- ${area.label}: ${section.summary}`);
+    }
+    if (pack.files.length) lines.push(`Frame sequences to study in reference/: ${pack.files.join(", ")}. reference/moments.json says what each row shows. Each row is one moment, frame by frame, left to right.`);
+    if (pack.source) lines.push(`The reference video itself: ${pack.source}`);
+    referenceNote = lines.join("\n");
+  } else {
+    const pack = chatReference(chat, join(dir, "reference"));
+    if (pack) {
+      lines.push("Read reference/facts.json for exact measurements of the reference.");
+      if (pack.files.length) lines.push(`Frame sequences to study in reference/: ${pack.files.join(", ")}. reference/moments.json says what each row shows. Each row is one moment, frame by frame, left to right.`);
+      if (pack.source) lines.push(`The reference video itself: ${pack.source}`);
+      referenceNote = lines.join("\n");
+    }
+  }
+
+  writeFileSync(join(dir, "words.json"), JSON.stringify(words));
+  writeFileSync(join(dir, "brief.md"), `# Motion brief ${id}
+
+## The job
+${a.job}
+${a.notes ? `\n${a.notes}\n` : ""}
+## What to make
+- ${a.kind === "overlay" ? "A transparent clip that sits on top of the speaker, who stays visible. The video's captions keep running, so don't repeat the spoken words." : "A full-screen clip that replaces the picture. The speaker's voice carries on underneath. Captions are turned off across this clip, so any words the viewer should read belong in your design."}
+- Exactly ${seconds} seconds, ${doc.output.width}x${doc.output.height}, ${doc.output.fps} fps. No audio.
+- Save it to ${output} inside this mission.
+
+## The section
+- ${rel}/section.mp4 is the cut section, so you can see and hear what's being said.
+- ${rel}/words.json has every word with its start and end in seconds from the start of your clip. Land each beat on its word.
+- The line: "${words.map((w) => w.text).join(" ")}"
+
+## The reference
+${referenceNote}
+`);
+  docs.apply(chat.id, [{ op: "reserve_graphic", id, from: a.from, to: a.to, label: a.job.slice(0, 60) }], `Waiting on the Motion agent: ${a.job.slice(0, 40)}`);
+  return { id, brief: `${rel}/brief.md`, output, seconds, kind: a.kind };
+}

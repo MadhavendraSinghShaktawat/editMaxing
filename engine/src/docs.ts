@@ -4,7 +4,7 @@ import type { Chats } from "./claude/chat.ts";
 import type { Database } from "./db.ts";
 import { json } from "./db.ts";
 import type { EditDoc, Op } from "./editdoc.ts";
-import { analyzeTakes, applyOps, newDoc, segments, totalDuration, wordSpan, toOutput, isRemoved } from "./editdoc.ts";
+import { analyzeTakes, applyOps, joinWords, newDoc, segments, totalDuration, withLayers, wordSpan, toOutput, isRemoved } from "./editdoc.ts";
 import type { Files } from "./files.ts";
 import type { JobContext, Jobs } from "./jobs.ts";
 import { editDistance } from "./lib/dsa.ts";
@@ -33,13 +33,13 @@ export class Docs {
 
   latest(chatId: string) {
     const r = this.db.get<{ doc: string; version: number }>("SELECT doc, version FROM edit_docs WHERE chat_id = ? ORDER BY version DESC LIMIT 1", chatId);
-    return r ? { doc: json<EditDoc>(r.doc, null as never), version: r.version } : null;
+    return r ? { doc: withLayers(json<EditDoc>(r.doc, null as never)), version: r.version } : null;
   }
 
   at(chatId: string, version: number) {
     const r = this.db.get<{ doc: string }>("SELECT doc FROM edit_docs WHERE chat_id = ? AND version = ?", chatId, version);
     if (!r) throw new Error(`There is no version ${version}.`);
-    return json<EditDoc>(r.doc, null as never);
+    return withLayers(json<EditDoc>(r.doc, null as never));
   }
 
   versions(chatId: string) {
@@ -77,7 +77,7 @@ export class Docs {
 
   summary(doc: EditDoc) {
     const segs = segments(doc);
-    return { sourceSeconds: Number(doc.source.duration.toFixed(2)), outputSeconds: Number(totalDuration(segs).toFixed(2)), cuts: segs.length - 1, removedWords: doc.removed.reduce((n, [a, b]) => n + b - a + 1, 0), words: doc.words.length, broll: doc.broll.length, graphics: doc.graphics.length, sfx: doc.sfx.length, music: doc.music.length, captions: doc.captions.enabled, output: doc.output };
+    return { sourceSeconds: Number(doc.source.duration.toFixed(2)), outputSeconds: Number(totalDuration(segs).toFixed(2)), cuts: segs.length - 1, removedWords: doc.removed.reduce((n, [a, b]) => n + b - a + 1, 0), words: doc.words.length, broll: doc.broll.length, graphics: doc.graphics.length, sfx: doc.sfx.length, music: doc.music.length, cameraMoves: doc.moves.length, transitions: doc.transitions.length, cards: doc.cards.length, effects: doc.effects.length, styledWords: doc.emphasis.length, waitingOnMotionAgent: doc.reserved.map((r) => r.label), captions: doc.captions.enabled, output: doc.output };
   }
 
   /** Compact view for Claude: numbered words, with cuts marked, and no timing noise. */
@@ -88,7 +88,7 @@ export class Docs {
     const segs = segments(doc);
     const text = doc.words.slice(from, to + 1).map((w) => (isRemoved(doc, w.i) ? `~${w.i}:${w.text}~` : `${w.i}:${w.text}`)).join(" ");
     const place = (o: { id: string; from: number; to: number; label?: string }) => ({ id: o.id, from: o.from, to: o.to, label: o.label, ...wordSpan(doc, segs, o.from, o.to) });
-    return { version, ...this.summary(doc), transcript: text, broll: doc.broll.map(place), graphics: doc.graphics.map(place), sfx: doc.sfx.map((s) => ({ id: s.id, word: s.word, at: toOutput(segs, doc.words[s.word].t0) + s.offset, label: s.label })), keepPauses: doc.keepPauses, maxPause: doc.maxPause };
+    return { version, ...this.summary(doc), transcript: text, broll: doc.broll.map(place), graphics: doc.graphics.map(place), sfx: doc.sfx.map((s) => ({ id: s.id, word: s.word, at: toOutput(segs, doc.words[s.word].t0) + s.offset, label: s.label })), moves: doc.moves.map((m) => ({ ...place(m), kind: m.kind, amount: m.amount })), transitions: doc.transitions.map((t) => ({ id: t.id, word: t.word, kind: t.kind, seconds: t.seconds })), cards: doc.cards.map((c) => ({ ...place(c), color: c.color })), effects: doc.effects.map((e) => ({ ...place(e), kind: e.kind })), reserved: doc.reserved, cutsBeforeWords: joinWords(doc, segs), keepPauses: doc.keepPauses, maxPause: doc.maxPause };
   }
 
   takes(chatId: string) {
@@ -113,6 +113,7 @@ export class Docs {
     if (!current) throw new Error("Open the footage first.");
     const version = p.version ?? current.version;
     const doc = p.version ? this.at(p.chatId, p.version) : current.doc;
+    if (!p.preview && doc.reserved.length) throw new Error(`Still waiting on the Motion agent for: ${doc.reserved.map((r) => r.label).join(", ")}. Place its clip with add_graphic, or remove the reservation.`);
     const work = join(chat.cwd, "work", "render");
     const out = join(chat.cwd, "out");
     mkdirSync(work, { recursive: true });

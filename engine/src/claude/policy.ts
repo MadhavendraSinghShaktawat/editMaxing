@@ -3,7 +3,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 export type Verdict = { behavior: "allow" } | { behavior: "ask"; reason: string } | { behavior: "deny"; reason: string };
 
 /** Reads, listing and media work that can't harm anything. */
-const SAFE = new Set(["ls", "cat", "head", "tail", "wc", "grep", "rg", "sed", "awk", "sort", "uniq", "cut", "tr", "echo", "printf", "pwd", "date", "basename", "dirname", "realpath", "stat", "file", "du", "df", "which", "true", "false", "test", "[", "jq", "sips", "ffmpeg", "ffprobe", "node", "npm", "npx", "python3", "python", "bash", "sh", "mkdir", "touch", "cp", "ln", "tee", "seq", "sleep", "pip", "pip3", "env", "cd", "export", "xargs", "find", "shasum", "open"]);
+const SAFE = new Set(["ls", "cat", "head", "tail", "wc", "grep", "rg", "sed", "awk", "sort", "uniq", "cut", "tr", "echo", "printf", "pwd", "date", "basename", "dirname", "realpath", "stat", "file", "du", "df", "which", "true", "false", "test", "[", "jq", "sips", "ffmpeg", "ffprobe", "node", "npm", "npx", "python3", "python", "bash", "sh", "mkdir", "touch", "cp", "ln", "tee", "seq", "sleep", "pip", "pip3", "env", "cd", "export", "xargs", "find", "shasum", "open", "diff", "cmp", "fc-list", "pgrep", "ps", "nproc", "sysctl", "uname", "wait", "basename", "paste", "rev", "bc"]);
 
 /** Anything that leaves the Mac or can't be undone needs a person. */
 const SENSITIVE = new Map([
@@ -33,6 +33,7 @@ export function splitCommands(line: string) {
   let substitution = false;
   let redirect = false;
   const redirects: string[] = [];
+  const heredocs: string[] = [];
   const endWord = () => {
     if (hasWord) {
       if (redirect) {
@@ -73,6 +74,16 @@ export function splitCommands(line: string) {
       endWord();
     } else if (c === ";" || c === "\n" || c === "|" || c === "(" || c === ")") {
       endCommand();
+      // A heredoc's body is data for the command above it, never commands of its own.
+      while (c === "\n" && heredocs.length) {
+        const tag = heredocs.shift()!;
+        let end = line.indexOf("\n", i + 1);
+        while (end !== -1 && line.slice(i + 1, end).replace(/^\t+/, "") !== tag) {
+          i = end;
+          end = line.indexOf("\n", i + 1);
+        }
+        i = end === -1 ? line.length : end;
+      }
     } else if (c === "&") {
       if (line[i + 1] === ">") {
         i++;
@@ -89,6 +100,13 @@ export function splitCommands(line: string) {
       redirect = true;
     } else if (c === "<") {
       endWord();
+      if (line[i + 1] === "<" && line[i + 2] !== "<") {
+        const tag = line.slice(i + 2).match(/^-?\s*(?:'([^']+)'|"([^"]+)"|\\?([\w.-]+))/);
+        if (tag) {
+          heredocs.push(tag[1] ?? tag[2] ?? tag[3]);
+          i += 1 + tag[0].length;
+        }
+      } else if (line[i + 1] === "<") i += 2;
     } else {
       word += c;
       hasWord = true;
@@ -104,6 +122,11 @@ const SENDS = /^(-[a-zA-Z]*[dFTXK]|--data|--data-\S+|--json|--form|--form-string
 const program = (words: string[]) => {
   let i = 0;
   while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i])) i++;
+  // A time limit is transparent: what matters is the program it runs.
+  if (words[i] === "timeout" || words[i] === "gtimeout") {
+    i++;
+    while (i < words.length && (words[i].startsWith("-") || /^\d/.test(words[i]))) i++;
+  }
   return { name: (words[i] ?? "").split("/").pop() ?? "", args: words.slice(i + 1) };
 };
 
@@ -139,7 +162,15 @@ export function checkBash(command: string, workspace: string, allowed: Set<strin
   return { behavior: "allow" };
 }
 
+/** One main editor, and at most one Motion agent beside it. */
+export function checkAgent(input: Record<string, unknown>, busy: boolean): Verdict {
+  if (input.subagent_type !== "motion") return { behavior: "deny", reason: `Only the Motion agent can be started here, using subagent_type "motion". Do the rest of the edit yourself.` };
+  if (busy) return { behavior: "deny", reason: "The Motion agent is already working. Carry on with the edit. When it reports back, send the next brief." };
+  return { behavior: "allow" };
+}
+
 export function checkTool(name: string, input: Record<string, unknown>, workspace: string, allowed: Set<string>, readable: string[]): Verdict {
+  if (name === "ScheduleWakeup" || name === "CronCreate") return { behavior: "deny", reason: "Don't schedule a check. End your turn: the Motion agent's report wakes you by itself." };
   if (allowed.has(name)) return { behavior: "allow" };
   if (name === "Bash") return checkBash(String(input.command ?? ""), workspace, allowed);
   if (name === "Write" || name === "Edit" || name === "NotebookEdit") {
@@ -154,6 +185,6 @@ export function checkTool(name: string, input: Record<string, unknown>, workspac
     return { behavior: "ask", reason: `reads a file outside this mission: ${path}` };
   }
   if (name.startsWith("mcp__dojo__") || name.startsWith("mcp__earshot__") || name.startsWith("mcp__epidemic__")) return { behavior: "allow" };
-  if (["Skill", "TodoWrite", "Task", "Agent", "WebSearch", "WebFetch", "ToolSearch", "BashOutput", "KillShell", "TaskOutput", "TaskStop"].includes(name)) return { behavior: "allow" };
+  if (["Skill", "TodoWrite", "Task", "Agent", "WebSearch", "WebFetch", "ToolSearch", "BashOutput", "KillShell", "TaskOutput", "TaskStop", "ListAgents"].includes(name)) return { behavior: "allow" };
   return { behavior: "ask", reason: `uses ${name}` };
 }

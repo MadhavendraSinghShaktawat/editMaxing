@@ -34,7 +34,7 @@ Status key: `[x]` built and tested on a real run, `[~]` built but not yet tested
 - [x] Vendor the Barty-Bart motion-graphics skills under their MIT licence
 - [x] Earshot installed as a tool pack and connected as an MCP server, so Claude can hear audio
 - [x] Skills packaged as one Claude Code plugin and loaded per chat
-- [x] Dojo skills: editor workflow, B-roll director, reference analysis
+- [x] Dojo skills: editor workflow, B-roll director, full style recreation (`reference-style`), Motion agent (`motion-artist`)
 
 ## 5. Native Mac tools (Swift, no paid API)
 - [x] Video background removal with Vision, saved once as ProRes 4444 or HEVC with alpha
@@ -60,6 +60,14 @@ Status key: `[x]` built and tested on a real run, `[~]` built but not yet tested
 - [x] Reference analysis by Claude only, using local measurements as evidence
 - [x] Every rule cites timestamps; rules that disagree with measurements get rechecked
 - [x] Style Card approval before a style goes live
+- [x] Style Card covers pacing, editing, audio, captions, positioning, motion, animation, effects and transitions. Colour grading is left out on purpose
+- [x] Local measuring: every join and transition type, jump cuts, solid cards, camera moves (Apple Vision registration), punch-ins, pace, caption and framing stats, Earshot music, effects and sync
+- [x] Claude sees movement as frame sequences, and a rule about movement must cite one
+- [x] Main editor plus one background Motion agent, which receives the reference. No other agents can start
+- [x] Editor controls: camera moves, cut transitions, solid cards, effects, placed and animated overlays, caption animation, per-word styling
+- [x] `check_motion` compares a render's pace with the reference. No fixed target
+- [x] The Mac stays awake while chats and jobs run
+- [x] No built-in styles or prompts. Shared styles live in `library/styles/`, and `npm run style` packs and checks them
 - [x] Personal Memory: repeated corrections become rules that can be edited or removed
 - [x] Prompt Recipes
 

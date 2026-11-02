@@ -5,11 +5,12 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { CanUseTool, McpServerConfig, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Bus } from "../bus.ts";
 import { DIRS, MOTION_MODULES, MOTION_PYTHON, PLUGIN_DIR } from "../config.ts";
+import { MOTION_AGENT } from "../prompt.ts";
 import type { Database } from "../db.ts";
 import { json } from "../db.ts";
 import { AsyncQueue } from "../lib/dsa.ts";
 import type { Accounts } from "./accounts.ts";
-import { checkTool } from "./policy.ts";
+import { checkAgent, checkTool } from "./policy.ts";
 
 export type Station = "library" | "cutting" | "animation" | "captions" | "living" | "sound" | "render" | "review";
 export type ChatStatus = "idle" | "working" | "thinking" | "needs" | "stuck" | "resting";
@@ -41,6 +42,7 @@ export function stationFor(tool: string, input: Record<string, unknown>): { stat
   if (/caption/.test(name)) return { station: "captions", detail: "Timing captions" };
   if (/render|quality_check|export/.test(name)) return { station: "render", detail: "Rendering" };
   if (/remove_background|depth|parallax|track/.test(name)) return { station: "animation", detail: "Running a video tool" };
+  if (/brief_motion_agent/.test(name) || tool === "Agent" || tool === "Task") return { station: "animation", detail: "Briefing the Motion agent" };
   if (tool === "Bash") {
     const c = String(input.command ?? "");
     if (/render\.js|playwright/.test(c)) return { station: "render", detail: "Rendering" };
@@ -54,7 +56,7 @@ export type Brief = { title?: string; modeId?: string | null; styleId?: string |
 
 type Pending = { resolve: (answer: unknown) => void; chatId: string };
 
-type Runtime = { q: Query; input: AsyncQueue<SDKUserMessage>; idle: NodeJS.Timeout | null; allowed: Set<string> };
+type Runtime = { q: Query; input: AsyncQueue<SDKUserMessage>; idle: NodeJS.Timeout | null; allowed: Set<string>; motion: Set<string>; spawning: boolean };
 
 export type ChatDeps = {
   mcp: (chat: ChatRow) => Promise<Record<string, McpServerConfig>>;
@@ -203,14 +205,14 @@ export class Chats {
     const chat = this.row(id);
     const input = new AsyncQueue<SDKUserMessage>();
     const allowed = new Set<string>();
-    const canUseTool: CanUseTool = (name, toolInput, options) => this.permission(id, name, toolInput, options.signal, allowed);
+    const canUseTool: CanUseTool = (name, toolInput, options) => this.permission(id, name, toolInput, options.signal, allowed, options.agentID);
     const account = await this.accounts.options(chat.account_id);
     const q = query({
       prompt: input,
       options: {
         ...account,
         // Renders and first-run model loads take far longer than a normal tool call.
-        env: { ...account.env, ...(await this.deps.env?.()), PATH: `${MOTION_PYTHON}${delimiter}${account.env?.PATH}`, MCP_TIMEOUT: "60000", MCP_TOOL_TIMEOUT: "3600000" },
+        env: { ...account.env, ...(await this.deps.env?.()), PATH: `${MOTION_PYTHON}${delimiter}${account.env?.PATH}`, MCP_TIMEOUT: "60000", MCP_TOOL_TIMEOUT: "3600000", DOJO_MOTION_KIT: join(PLUGIN_DIR, "skills/motion-broll"), BASH_DEFAULT_TIMEOUT_MS: "1800000", BASH_MAX_TIMEOUT_MS: "3600000" },
         cwd: chat.cwd,
         model: chat.model,
         effort: (chat.effort ?? undefined) as "medium" | undefined,
@@ -218,12 +220,24 @@ export class Chats {
         settingSources: [],
         plugins: existsSync(PLUGIN_DIR) ? [{ type: "local", path: PLUGIN_DIR }] : [],
         mcpServers: await this.deps.mcp(chat),
+        agents: {
+          motion: {
+            description: "Builds a premium motion graphic from a brief while you carry on with the edit. Give it every brief at once.",
+            prompt: MOTION_AGENT,
+            model: "inherit",
+            effort: "high",
+            background: true,
+            skills: ["shifu-dojo:motion-artist"],
+            tools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "mcp__dojo__view_frames", "mcp__dojo__check_motion"],
+            disallowedTools: ["Agent", "Task"],
+          },
+        },
         canUseTool,
         includePartialMessages: true,
         systemPrompt: { type: "preset", preset: "claude_code", append: this.deps.prompt(chat) },
       },
     });
-    const rt: Runtime = { q, input, idle: null, allowed };
+    const rt: Runtime = { q, input, idle: null, allowed, motion: new Set(), spawning: false };
     this.runtimes.set(id, rt);
     void this.pump(id, rt);
     return rt;
@@ -248,6 +262,15 @@ export class Chats {
     switch (m.type) {
       case "system":
         if (m.subtype === "init") this.status(id, { session_id: m.session_id });
+        else if (m.subtype === "task_started" && m.subagent_type === "motion") {
+          rt.motion.add(m.task_id);
+          rt.spawning = false;
+          this.message(id, "editor", "tool", "The Motion agent started building", { tool: "Agent" });
+        } else if (m.subtype === "task_notification" && rt.motion.delete(m.task_id)) {
+          const ok = m.status === "completed";
+          this.message(id, "editor", "tool", ok ? "The Motion agent finished" : "The Motion agent stopped early", { tool: "Agent" });
+          if (this.row(id).status === "working") this.status(id, { detail: "Placing the motion graphic" });
+        }
         break;
       case "stream_event": {
         const e = m.event as { type: string; delta?: { type: string; text?: string } };
@@ -276,6 +299,13 @@ export class Chats {
       case "result": {
         const errors = m.subtype === "success" ? [] : m.errors ?? [];
         if (m.subtype !== "success" && !errors.some((e) => /interrupt|aborted/i.test(e))) this.message(id, "system", "error", errors[0] ?? `The editor stopped: ${m.subtype}`);
+        rt.spawning = false;
+        // The editor can finish its turn while the Motion agent works. Its report starts the next turn by itself.
+        if (rt.motion.size && m.subtype === "success") {
+          this.status(id, { status: "working", detail: "The Motion agent is building a graphic", station: "animation", cost: m.total_cost_usd });
+          this.accounts.noteRateLimit(this.row(id).account_id);
+          break;
+        }
         this.status(id, { status: m.subtype === "success" ? "idle" : "stuck", detail: m.subtype === "success" ? "" : "Stopped", cost: m.total_cost_usd });
         rt.idle = setTimeout(() => this.close(id), IDLE_CLOSE_MS);
         rt.idle.unref();
@@ -294,8 +324,17 @@ export class Chats {
     return draft;
   }
 
-  private async permission(id: string, name: string, input: Record<string, unknown>, signal: AbortSignal, allowed: Set<string>) {
+  private async permission(id: string, name: string, input: Record<string, unknown>, signal: AbortSignal, allowed: Set<string>, agent?: string) {
     const chat = this.row(id);
+    // A background command would let the Motion agent report done before its render exists.
+    if (agent && input.run_in_background) return { behavior: "deny" as const, message: "Run this in the foreground and wait for it. Don't report back until the clip exists." };
+    if (name === "Agent" || name === "Task") {
+      const rt = this.runtimes.get(id);
+      const verdict = checkAgent(input, !!rt && (rt.spawning || rt.motion.size > 0));
+      if (verdict.behavior === "deny") return { behavior: "deny" as const, message: verdict.reason };
+      if (rt) rt.spawning = true;
+      return { behavior: "allow" as const, updatedInput: input };
+    }
     if (name === "AskUserQuestion") {
       const answer = (await this.ask(id, "question", input, signal)) as { answers?: unknown; response?: string } | null;
       if (!answer) return { behavior: "deny" as const, message: "No answer was given." };
@@ -341,7 +380,10 @@ export class Chats {
   }
 
   async interrupt(id: string) {
-    await this.runtimes.get(id)?.q.interrupt().catch(() => {});
+    const rt = this.runtimes.get(id);
+    for (const task of rt?.motion ?? []) await rt?.q.stopTask(task).catch(() => {});
+    rt?.motion.clear();
+    await rt?.q.interrupt().catch(() => {});
     this.status(id, { status: "idle", detail: "" });
   }
 
@@ -377,7 +419,7 @@ const LABELS: Record<string, string> = {
   open_footage: "Opening the footage", get_edit_doc: "Reading the transcript", analyze_takes: "Finding retakes and fillers", edit_ops: "Changing the edit", restore_version: "Restoring a version",
   render_preview: "Rendering a preview", render_final: "Rendering the final video", view_frames: "Checking frames", search_broll: "Searching B-roll", browse_library: "Browsing the library",
   view_filmstrip: "Looking at a shot", find_similar: "Finding similar shots", use_clip: "Placing B-roll", log_choice: "Noting a rejected shot", remove_background: "Removing the background",
-  reframe: "Reframing", parallax: "Building a 3D camera move", track_camera: "Tracking the camera", measure_reference: "Measuring the reference", list_free_sfx: "Browsing sound effects", ask_choice: "Asking you to pick",
+  brief_motion_agent: "Cutting a section for the Motion agent", check_motion: "Checking the motion", list_fonts: "Choosing a font", reframe: "Reframing", parallax: "Building a 3D camera move", track_camera: "Tracking the camera", measure_reference: "Measuring the reference", list_free_sfx: "Browsing sound effects", ask_choice: "Asking you to pick",
 };
 
 export function toolLabel(tool: string, input: Record<string, unknown>) {
@@ -386,6 +428,7 @@ export function toolLabel(tool: string, input: Record<string, unknown>) {
   if (tool.startsWith("mcp__earshot__")) return "Listening to the audio";
   if (tool.startsWith("mcp__epidemic__")) return "Searching Epidemic Sound";
   const short = tool.replace(/^mcp__/, "").replace(/__/g, " ");
+  if (tool === "Agent" || tool === "Task") return "Briefing the Motion agent";
   if (tool === "Bash") return String(input.description ?? "Running a command").slice(0, 80);
   if (tool === "Read") return `Reading ${basename(String(input.file_path ?? ""))}`;
   if (tool === "Write" || tool === "Edit") return `Writing ${basename(String(input.file_path ?? ""))}`;

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
@@ -15,6 +15,9 @@ import type { Files } from "./files.ts";
 import type { Library } from "./library.ts";
 import { frameAt } from "./lib/media.ts";
 import { secrets } from "./lib/secrets.ts";
+import { paceOf, writeBrief } from "./motion.ts";
+import { run } from "./lib/proc.ts";
+import { nativeBin } from "./config.ts";
 import type { Styles } from "./styles.ts";
 import type { Tools } from "./tools.ts";
 
@@ -31,6 +34,10 @@ const STAGES: Record<string, { station: Station; detail: string }> = {
   sound: { station: "sound", detail: "Designing sound" },
   review: { station: "review", detail: "Ready for review" },
 };
+
+const entrance = z.strictObject({ kind: z.enum(["none", "fade", "slide_up", "slide_down", "slide_left", "slide_right", "pop"]), seconds: z.number().min(0.02).max(3) });
+const box = z.strictObject({ x: z.number(), y: z.number(), w: z.number(), h: z.number() }).describe("Place in the frame as fractions from the top left.");
+const cameraKind = z.enum(["push_in", "pull_out", "punch_in", "pan_left", "pan_right", "pan_up", "pan_down", "shake"]);
 
 const text = (v: unknown): Result => ({ content: [{ type: "text", text: typeof v === "string" ? v : JSON.stringify(v) }] });
 
@@ -57,14 +64,35 @@ const opSchema = z.discriminatedUnion("op", [
   z.strictObject({ op: z.literal("restore_words"), from: z.number().int(), to: z.number().int() }),
   z.strictObject({ op: z.literal("set_max_pause"), seconds: z.number().nullable() }),
   z.strictObject({ op: z.literal("keep_pause"), word: z.number().int() }),
-  z.strictObject({ op: z.literal("add_broll"), from: z.number().int(), to: z.number().int(), shotId: z.string().optional(), path: z.string().optional(), in: z.number().optional(), label: z.string().optional() }),
-  z.strictObject({ op: z.literal("add_graphic"), from: z.number().int(), to: z.number().int(), path: z.string(), label: z.string().optional() }),
+  z.strictObject({ op: z.literal("add_broll"), from: z.number().int(), to: z.number().int(), shotId: z.string().optional(), path: z.string().optional(), in: z.number().optional(), label: z.string().optional(), enter: entrance.optional(), exit: entrance.optional(), box: box.optional(), speed: z.number().optional(), move: z.strictObject({ kind: cameraKind, amount: z.number() }).optional() }),
+  z.strictObject({ op: z.literal("add_graphic"), from: z.number().int(), to: z.number().int(), path: z.string(), label: z.string().optional(), enter: entrance.optional(), exit: entrance.optional(), box: box.optional(), reservation: z.string().optional().describe("The Motion agent brief id this clip fulfils."), hideCaptions: z.boolean().optional().describe("Turn captions off across this clip, because it shows the words itself.") }),
+  z.strictObject({ op: z.literal("add_move"), from: z.number().int(), to: z.number().int(), kind: cameraKind, amount: z.number().optional().describe("0.08 means 8%."), ease: z.enum(["smooth", "snap", "linear"]).optional(), x: z.number().optional(), y: z.number().optional() }),
+  z.strictObject({ op: z.literal("add_transition"), word: z.number().int().describe("The first word after a cut. See cutsBeforeWords in get_edit_doc."), kind: z.enum(["fade", "dissolve", "dip_black", "dip_white", "slide_left", "slide_right", "slide_up", "slide_down", "smooth_left", "smooth_right", "zoom_in", "blur", "circle", "whip_left", "whip_right"]), seconds: z.number().optional() }),
+  z.strictObject({ op: z.literal("add_card"), from: z.number().int(), to: z.number().int(), color: z.string(), label: z.string().optional() }),
+  z.strictObject({ op: z.literal("add_effect"), from: z.number().int(), to: z.number().int(), kind: z.enum(["flash", "blur", "rgb_split", "grain"]), amount: z.number().optional() }),
+  z.strictObject({ op: z.literal("style_words"), from: z.number().int(), to: z.number().int(), scale: z.number().optional(), font: z.string().optional(), color: z.string().optional(), breakBefore: z.boolean().optional(), x: z.number().optional(), y: z.number().optional() }),
+  z.strictObject({ op: z.literal("clear_word_styles"), from: z.number().int(), to: z.number().int() }),
   z.strictObject({ op: z.literal("add_sfx"), word: z.number().int(), path: z.string(), offset: z.number().optional(), gainDb: z.number().optional(), label: z.string().optional() }),
   z.strictObject({ op: z.literal("add_music"), path: z.string(), gainDb: z.number().optional(), duck: z.boolean().optional(), label: z.string().optional() }),
   z.strictObject({ op: z.literal("remove_item"), id: z.string() }),
-  z.strictObject({ op: z.literal("set_captions"), enabled: z.boolean().optional(), maxWords: z.number().int().optional(), uppercase: z.boolean().optional(), font: z.string().optional(), size: z.number().optional(), color: z.string().optional(), highlight: z.string().optional(), position: z.number().optional() }),
+  z.strictObject({ op: z.literal("set_captions"), enabled: z.boolean().optional(), maxWords: z.number().int().optional(), uppercase: z.boolean().optional(), font: z.string().optional(), size: z.number().optional(), color: z.string().optional(), highlight: z.string().optional(), position: z.number().optional(), x: z.number().optional(), strokeColor: z.string().optional(), strokeWidth: z.number().optional(), glowColor: z.string().optional(), glowRadius: z.number().optional(), boxColor: z.string().optional(), boxOpacity: z.number().optional(), animation: z.enum(["none", "fade", "pop", "rise", "drop", "stretch"]).optional(), animationSeconds: z.number().optional(), reveal: z.enum(["chunk", "word"]).optional(), lineHeight: z.number().optional(), maxWidth: z.number().optional() }),
   z.strictObject({ op: z.literal("set_output"), width: z.number().int(), height: z.number().int() }),
 ]);
+
+/** What the reference's pace was, so a render can be compared with it. */
+function referencePace(chat: ChatRow, d: Deps) {
+  const styleId = json<Brief>(chat.mission, {}).styleId;
+  const style = styleId ? d.styles.list().find((s) => s.id === styleId) : null;
+  const measured = (style?.card as { measurements?: { pace?: unknown } } | undefined)?.measurements?.pace;
+  if (measured) return measured;
+  const root = join(chat.cwd, "work/reference");
+  if (!existsSync(root)) return null;
+  for (const name of readdirSync(root)) {
+    const facts = join(root, name, "facts.json");
+    if (existsSync(facts)) return (JSON.parse(readFileSync(facts, "utf8")) as { pace?: unknown }).pace ?? null;
+  }
+  return null;
+}
 
 export function dojoServer(chat: ChatRow, d: Deps) {
   const id = chat.id;
@@ -128,7 +156,22 @@ export function dojoServer(chat: ChatRow, d: Deps) {
       tool("render_final", "Render at full quality, run the quality check, and write the MP4, SRT and FCPXML for Resolve.", {}, safe(async () => {
         const r = await d.docs.queueRender(id, false);
         sendVideo(r.path, `V${r.version}`, `Version ${r.version}`, { quality: r.quality, srt: r.srt, fcpxml: r.fcpxml });
-        return text(r);
+        return text({ ...r, pace: await paceOf(r.path).catch(() => null), referencePace: referencePace(chat, d) });
+      })),
+      tool("check_motion", "Measure how alive a video stays: how often something new happens, the longest stretch where nothing does, and any frozen stretches. Compare it with the reference's pace. There is no fixed target; the reference sets it.", { path: z.string() }, safe(async (a) => text({ pace: await paceOf(allowedPath(chat, a.path)), referencePace: referencePace(chat, d) }))),
+      tool("list_fonts", "List font names that captions can use. A name that isn't listed quietly falls back to Helvetica.", { search: z.string().optional() }, safe(async (a) => {
+        const bin = nativeBin();
+        if (!bin) throw new Error("The native tools are not built.");
+        const { stdout } = await run(bin, ["fonts"]);
+        const fonts = (JSON.parse(stdout.trim().split("\n").pop()!) as { result: { fonts: string[] } }).result.fonts;
+        const needle = a.search?.toLowerCase();
+        return text(needle ? fonts.filter((f) => f.toLowerCase().includes(needle)) : fonts);
+      })),
+      tool("brief_motion_agent", "Cut a section of the video out for the Motion agent. Packages the section, its timed words and the reference, and reserves those words. Make one brief per graphic. Then start the Motion agent once with the Agent tool, giving it every brief, and carry on with the rest of the edit.", {
+        from: z.number().int(), to: z.number().int(), job: z.string().describe("What this graphic must explain, in a sentence or two."), kind: z.enum(["full_screen", "overlay"]).describe("full_screen replaces the picture. overlay is transparent and sits over the speaker."), notes: z.string().optional(),
+      }, safe(async (a) => {
+        const brief = await writeBrief(chats().row(id), d.docs, d.styles, a);
+        return text({ ...brief, next: `Give the Motion agent this brief with the Agent tool: subagent_type "motion", prompt "Build ${brief.brief}". When it reports back, place ${brief.output} with add_graphic on words ${a.from}-${a.to}, with reservation "${brief.id}"${a.kind === "full_screen" ? " and hideCaptions true, because the clip shows the words itself" : ""}.` });
       })),
 
       tool("view_frames", "See frames from any video, such as a render you just made. Use it to check captions, framing and overlays before saying a render looks right. Times are seconds into that video.", { path: z.string(), times: z.array(z.number()).min(1).max(8) }, safe(async (a) => {
@@ -196,12 +239,17 @@ export function dojoServer(chat: ChatRow, d: Deps) {
         const r = await d.tools.runJob<{ file: { path: string }; solved: number; frames: number; quality: number }>("tool.track", { hash: f.hash });
         return text({ path: r.file.path, solvedFrames: r.solved, totalFrames: r.frames, quality: r.quality });
       })),
-      tool("measure_reference", "Measure a reference video: cuts, shot lengths, pacing, captions, loudness and sound events. Returns facts plus frame images you can open with Read.", { path: z.string(), locale: z.string().optional() }, safe(async (a) => {
+      tool("measure_reference", "Measure a reference video: every cut and transition, camera moves, punch-ins, pace, captions, framing, loudness, music and sound effects. Returns facts, still frames, and frame sequences that show how things move.", { path: z.string(), locale: z.string().optional() }, safe(async (a) => {
         const f = await stored(a.path);
         const dir = join(chat.cwd, "work/reference", f.hash.slice(0, 8));
         mkdirSync(dir, { recursive: true });
         const m = await d.styles.measure(f.hash, a.locale ?? "en-US", dir);
-        return text({ facts: JSON.parse(d.styles.factsFor(m)), frames: m.frames.map((path, i) => ({ path, at: Number(m.picks[i].toFixed(1)) })), transcript: m.transcript });
+        const facts = JSON.parse(d.styles.factsFor(m)) as Record<string, unknown>;
+        const sheets = await d.styles.sequences(m.path, m.moments, m, dir, "motion", 6);
+        writeFileSync(join(dir, "facts.json"), JSON.stringify(facts));
+        writeFileSync(join(dir, "source.json"), JSON.stringify({ source: m.path }));
+        writeFileSync(join(dir, "moments.json"), JSON.stringify({ motion: sheets.map((s) => s.rows) }));
+        return text({ facts, frames: m.frames.map((path, i) => ({ path, at: Number(m.picks[i].toFixed(1)) })), sequences: sheets.map((s) => ({ path: s.path, rows: s.rows })), howToRead: "Each row of a sequence sheet is one moment shown as six frames, left to right.", transcript: m.transcript });
       })),
       tool("list_free_sfx", "List the bundled CC0 sound effects. Use the path with add_sfx.", { category: z.string().optional() }, safe(async (a) => {
         const dir = join(PLUGIN_DIR, "skills/sound-effects/sfx");

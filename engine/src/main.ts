@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { Bus } from "./bus.ts";
 import { Accounts } from "./claude/accounts.ts";
@@ -53,6 +54,12 @@ server.on("error", (e: NodeJS.ErrnoException) => {
   process.exit(1);
 });
 server.listen(PORT, "127.0.0.1", () => console.log(`Shifu Dojo is running at http://127.0.0.1:${PORT}/?k=${token}`));
+
+// A long edit shouldn't die because the Mac dozed off. Each hold lapses on its own, so a crash can't keep it awake.
+const awake = setInterval(() => {
+  if (chats.busy || jobs.busy) spawn("/usr/bin/caffeinate", ["-i", "-t", "70"], { stdio: "ignore", detached: true }).unref();
+}, 60_000);
+awake.unref();
 
 let stopping = false;
 const stop = () => {

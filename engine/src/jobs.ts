@@ -26,6 +26,11 @@ export class Jobs {
   private handlers = new Map<string, JobHandler>();
   private queues = new Map<Lane, Heap<Queued>>();
   private running = new Map<Lane, Map<string, AbortController>>();
+
+  get busy() {
+    return [...this.running.values()].some((lane) => lane.size > 0);
+  }
+
   private order = 0;
 
   constructor(db: Database, bus: Bus) {
