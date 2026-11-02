@@ -4,6 +4,10 @@ An AI video editing studio for the Social Shifu team. Each editor in the villa i
 
 Everything runs on your own Mac. The Mac app and the web page are two windows onto the same local engine.
 
+## Styles
+
+Shifu Dojo ships with no styles and no prompt templates. People make their own, and the maintainer chooses which ones go in the repo for everyone. To share one, follow the [Style Dojo guide](library/styles/README.md).
+
 ## What you need on the Mac
 
 - macOS 26 or newer on Apple Silicon. Word-timed transcripts use Apple's SpeechAnalyzer, which starts in macOS 26.
