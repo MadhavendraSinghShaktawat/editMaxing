@@ -181,12 +181,13 @@ export function EmptyStudio() {
   );
 }
 
-export type BoardId = "styles" | "prompts" | "library" | "tools" | "settings";
+export type BoardId = "styles" | "motion" | "prompts" | "library" | "tools" | "settings";
 
 export function Dock({ onBoard, onVideo }: { onBoard: (b: BoardId) => void; onVideo: () => void }) {
   const s = useStore();
   const items: { id: BoardId; label: string; icon: string }[] = [
     { id: "styles", label: "Styles", icon: "pen" },
+    { id: "motion", label: "Motion", icon: "wand" },
     { id: "prompts", label: "Prompts", icon: "text" },
     { id: "library", label: "B-roll", icon: "book" },
     { id: "tools", label: "Tools", icon: "sparkles" },

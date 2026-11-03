@@ -47,7 +47,7 @@ Recreate it with `add_music`, `add_sfx` on a word, and the `sound-effects` skill
 
 Look for: `captions.wordsOnScreen`, `lineHeightShareOfFrame`, `sizeContrast`, `uppercaseShare`, `heightFromBottom`, `alignment`, `wordsBuildUpShare` against `wordsReplacedShare`, then the sequences for typeface, weight, stroke, glow and how each word arrives.
 
-Recreate it in three steps:
+Recreate it in three steps. When the video's style is saved, `get_caption_preset` gives you steps 1 and 2 as a ready `set_captions` op; still check its font.
 
 1. Call `list_fonts`. Only listed names work. Choose the closest match, plus an accent font if the style mixes type.
 2. Use `set_captions`: `reveal` ("word" builds up, "chunk" replaces), `animation` (`pop`, `rise`, `drop`, `stretch`, `fade`), `maxWords`, `size`, `color`, `highlight`, `strokeColor`, `strokeWidth`, `glowColor`, `glowRadius`, `boxColor`, `position`.
@@ -72,6 +72,8 @@ Recreate it with `add_move`: `push_in`, `pull_out`, `punch_in`, `pan_left`, `pan
 Look for, in the sequences: how designed things arrive and leave. Are they snappy or soft? Do they overshoot and settle? Do parts follow each other in a stagger? Does anything keep drifting while it sits on screen?
 
 Recreate it on overlays with `enter` and `exit`, and on `add_broll` with `move`. Anything richer belongs to the Motion agent, who receives the reference and studies the same sequences.
+
+A saved style also keeps each of its animations in the Motion library, sorted by what it does (the operation), the lever it pulls (the domain) and the move (the technique). Use `suggest_animations` to find the ones that fit a moment, and pass them to `brief_motion_agent` as `examples`.
 
 ### Effects and transitions
 

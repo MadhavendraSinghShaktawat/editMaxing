@@ -13,12 +13,16 @@ export type Lane = keyof typeof LANES;
 
 export type JobContext = {
   id: string;
+  /** The member who started the job. Background work with no owner is shown to admins only. */
+  owner: string | null;
   signal: AbortSignal;
   progress: (value: number, message?: string) => void;
 };
 export type JobHandler = (payload: never, ctx: JobContext) => Promise<unknown>;
 
-type Queued = { id: string; kind: string; lane: Lane; priority: number; order: number; payload: unknown; resolve?: (v: unknown) => void; reject?: (e: Error) => void };
+export type JobOptions = { lane?: Lane; priority?: number; owner?: string | null };
+
+type Queued = { id: string; kind: string; lane: Lane; priority: number; order: number; payload: unknown; owner: string | null; resolve?: (v: unknown) => void; reject?: (e: Error) => void };
 
 export class Jobs {
   private db: Database;
@@ -48,45 +52,51 @@ export class Jobs {
 
   /** Requeues work that was interrupted by a restart. Only resumable kinds are retried. */
   resume(kinds: string[]) {
-    const rows = this.db.all<{ id: string; kind: string; resource: Lane; priority: number; payload: string }>("SELECT id, kind, resource, priority, payload FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at");
+    const rows = this.db.all<{ id: string; kind: string; resource: Lane; priority: number; payload: string; owner_id: string | null }>("SELECT id, kind, resource, priority, payload, owner_id FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at");
     for (const r of rows) {
-      if (kinds.includes(r.kind)) this.enqueue({ id: r.id, kind: r.kind, lane: r.resource, priority: r.priority, order: this.order++, payload: json(r.payload, {}) });
+      if (kinds.includes(r.kind)) this.enqueue({ id: r.id, kind: r.kind, lane: r.resource, priority: r.priority, order: this.order++, payload: json(r.payload, {}), owner: r.owner_id });
       else this.finish(r.id, "failed", null, "Interrupted by a restart");
     }
     this.pump();
   }
 
-  private insert(kind: string, payload: unknown, lane: Lane, priority: number) {
+  private insert(kind: string, payload: unknown, lane: Lane, priority: number, owner: string | null) {
     const id = randomUUID();
     const now = Date.now();
-    this.db.run("INSERT INTO jobs (id, kind, status, priority, resource, payload, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)", id, kind, priority, lane, JSON.stringify(payload), now, now);
+    this.db.run("INSERT INTO jobs (id, kind, status, priority, resource, payload, created_at, updated_at, owner_id) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?)", id, kind, priority, lane, JSON.stringify(payload), now, now, owner);
     this.bus.emit("job", { id, kind, status: "queued", progress: 0 });
     return id;
   }
 
   /** Queues a job and returns its id immediately. */
-  add(kind: string, payload: unknown, options: { lane?: Lane; priority?: number } = {}) {
+  add(kind: string, payload: unknown, options: JobOptions = {}) {
     const lane = options.lane ?? "heavy";
     const priority = options.priority ?? 5;
-    const id = this.insert(kind, payload, lane, priority);
-    this.enqueue({ id, kind, lane, priority, order: this.order++, payload });
+    const owner = options.owner ?? null;
+    const id = this.insert(kind, payload, lane, priority, owner);
+    this.enqueue({ id, kind, lane, priority, order: this.order++, payload, owner });
     this.pump();
     return id;
   }
 
   /** Queues a job and resolves with its result. */
-  run<T>(kind: string, payload: unknown, options: { lane?: Lane; priority?: number } = {}) {
+  run<T>(kind: string, payload: unknown, options: JobOptions = {}) {
     const lane = options.lane ?? "heavy";
     const priority = options.priority ?? 5;
-    const id = this.insert(kind, payload, lane, priority);
+    const owner = options.owner ?? null;
+    const id = this.insert(kind, payload, lane, priority, owner);
     return new Promise<T>((resolve, reject) => {
-      this.enqueue({ id, kind, lane, priority, order: this.order++, payload, resolve: resolve as (v: unknown) => void, reject });
+      this.enqueue({ id, kind, lane, priority, order: this.order++, payload, owner, resolve: resolve as (v: unknown) => void, reject });
       this.pump();
     });
   }
 
   private enqueue(job: Queued) {
     this.queues.get(job.lane)!.push(job);
+  }
+
+  ownerOf(id: string) {
+    return this.db.get<{ owner_id: string | null }>("SELECT owner_id FROM jobs WHERE id = ?", id)?.owner_id ?? null;
   }
 
   cancel(id: string) {
@@ -116,6 +126,7 @@ export class Jobs {
     let last = 0;
     const ctx: JobContext = {
       id: job.id,
+      owner: job.owner,
       signal: controller.signal,
       progress: (value, message) => {
         const now = Date.now();

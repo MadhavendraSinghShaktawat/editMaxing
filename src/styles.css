@@ -2128,3 +2128,60 @@ button.card { text-align: left; font: inherit; color: inherit; cursor: pointer; 
 .msg ul { margin: 0 0 8px; padding-left: 18px; }
 .msg li + li { margin-top: 3px; }
 .msg code { padding: 1px 5px; border-radius: 5px; background: rgba(127,127,127,.16); font-size: .92em; }
+
+/* ── Settings, team and sign-in ───────────────────────────────── */
+
+.settings-shell { display: grid; grid-template-columns: 168px 1fr; gap: 20px; align-items: start; }
+.settings-nav { position: sticky; top: 0; display: grid; gap: 2px; padding-top: 12px; }
+.settings-nav button { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border: 0; border-radius: 8px; background: none; color: var(--text-2); font: inherit; font-size: 14px; text-align: left; cursor: pointer; }
+.settings-nav button:hover { background: var(--surface-2); color: var(--text); }
+.settings-nav button.on { background: var(--surface-3); color: var(--text); font-weight: 600; }
+.settings-nav .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--amber); }
+.settings { min-width: 0; }
+.settings code { padding: 1px 5px; border-radius: 5px; background: var(--surface-2); font-size: 12px; }
+@media (max-width: 720px) { .settings-shell { grid-template-columns: 1fr; } .settings-nav { position: static; display: flex; flex-wrap: wrap; } }
+
+.notice { margin: 8px 0 14px; padding: 10px 12px; border-radius: 10px; background: var(--surface-2); color: var(--text-2); font-size: 13px; line-height: 1.5; }
+.notice.bad { background: rgba(234, 79, 53, .12); color: var(--coral); }
+.danger-btn { height: 30px; padding: 0 10px; border: 0; border-radius: 8px; background: var(--coral); color: #fff; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
+
+.mode-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 8px; }
+.mode-card { display: grid; gap: 6px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.mode-card small { color: var(--text-2); font-size: 13px; line-height: 1.45; }
+.mode-card.on { border-color: #1f8c7f; box-shadow: 0 0 0 1px #1f8c7f inset; background: rgba(31, 140, 127, .08); }
+.mode-card:disabled { cursor: default; opacity: .7; }
+.mode-card.on:disabled { opacity: 1; }
+
+.memory-add, .library-picker, .invite-link, .login-code, .drive-setup { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0 12px; }
+.memory-add .why, .library-picker .why, .invite-link .why, .login-code .why, .drive-setup .why { flex: 1 1 160px; margin: 0; }
+.library-picker label { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); }
+.drive-setup ol { flex-basis: 100%; margin: 0; padding-left: 18px; }
+.login-code small { flex-basis: 100%; color: var(--text-2); }
+.memory-row.suggested { background: rgba(240, 168, 48, .08); border-radius: 8px; padding-left: 8px; padding-right: 8px; }
+.memory-row.needs_review small { color: var(--coral); }
+.memory-row.stale { opacity: .65; }
+.memory-row .why { max-width: none; }
+
+.share-editor { display: grid; gap: 6px; margin: 0 0 14px; padding: 12px; border-radius: 10px; background: var(--surface-2); }
+.share-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 14px; }
+.share-row select, .settings select { padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); font: inherit; font-size: 13px; }
+.share-editor .primary { justify-self: start; margin-top: 4px; }
+.client-block { margin-bottom: 4px; }
+
+.user-chat .back { margin-bottom: 8px; }
+.user-msg { margin: 0 0 8px; font-size: 14px; line-height: 1.5; color: var(--text-2); }
+.user-msg b { color: var(--text); margin-right: 6px; }
+
+.memory-card { display: grid; gap: 6px; margin: 6px 0; padding: 12px; border: 1px solid rgba(240, 168, 48, .45); border-radius: 12px; background: rgba(240, 168, 48, .08); font-size: 14px; }
+.memory-card span { color: var(--text-2); font-size: 12px; }
+.memory-card div { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+
+.hub-banner { position: fixed; left: 50%; bottom: 96px; transform: translateX(-50%); z-index: 40; padding: 10px 16px; border-radius: 999px; background: var(--hud); color: var(--hud-text); box-shadow: var(--shadow); font-size: 13px; backdrop-filter: blur(14px); }
+
+.auth-shell { display: grid; place-items: center; min-height: 100vh; padding: 24px; background: var(--surface-2); color: var(--text); font-family: var(--font-body); }
+.auth-card { width: min(440px, 100%); padding: 28px; border-radius: 20px; background: var(--surface); box-shadow: var(--shadow-lg); }
+.auth-card h1 { margin: 0 0 14px; font-family: var(--font-title); font-size: 24px; letter-spacing: -0.02em; }
+.auth-lead { margin: 0 0 10px; font-size: 16px; font-weight: 600; line-height: 1.4; }
+.auth-card .primary { margin-top: 8px; }
+.settings-shell { min-height: min(640px, 70vh); }
+.memory-add > .why:first-child, .invite-link > .why:first-child { flex: 3 1 280px; }

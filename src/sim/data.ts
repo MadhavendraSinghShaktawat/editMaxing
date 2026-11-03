@@ -32,15 +32,15 @@ export const LOOKS: Look[] = [
   { skin: SKIN.d[0], hair: "#231815", hairStyle: "afro", shirt: "#3d7fd9", pants: "#efe0bd", shoes: "#2d1b16" },
 ];
 
-export type Mission = { title: string; mode: string; style: string; length: string };
+export type Mission = { title: string; style: string; length: string };
 
 export const CREW_SEED: { name: string; role: string; look: number; mission: Mission | null; stage: number; progress: number }[] = [
-  { name: "Kai", role: "All-round editor", look: 0, mission: { title: "Why we quit our agency", mode: "YouTube Explainer", style: "Mode only", length: "8:42" }, stage: 1, progress: 0.42 },
-  { name: "Noor", role: "All-round editor", look: 1, mission: { title: "iPhone camera review", mode: "Product Review", style: "Mode only", length: "11:05" }, stage: 2, progress: 0.3 },
-  { name: "Wayan", role: "All-round editor", look: 6, mission: { title: "Ubud morning vlog", mode: "Vlog", style: "Mode only", length: "6:18" }, stage: 5, progress: 0.15 },
-  { name: "Aigerim", role: "All-round editor", look: 3, mission: { title: "Notion AI in 60 seconds", mode: "Instagram Reel", style: "Mode only", length: "0:58" }, stage: 3, progress: 0.55 },
-  { name: "Leo", role: "All-round editor", look: 4, mission: { title: "Build a landing page", mode: "YouTube Tutorial", style: "Mode only", length: "14:30" }, stage: 6, progress: 0.2 },
-  { name: "Mei", role: "All-round editor", look: 5, mission: { title: "Five mistakes founders make", mode: "Instagram Reel", style: "Mode only", length: "1:12" }, stage: 4, progress: 0.7 },
+  { name: "Kai", role: "All-round editor", look: 0, mission: { title: "Why we quit our agency", style: "Mode only", length: "8:42" }, stage: 1, progress: 0.42 },
+  { name: "Noor", role: "All-round editor", look: 1, mission: { title: "iPhone camera review", style: "Mode only", length: "11:05" }, stage: 2, progress: 0.3 },
+  { name: "Wayan", role: "All-round editor", look: 6, mission: { title: "Ubud morning vlog", style: "Mode only", length: "6:18" }, stage: 5, progress: 0.15 },
+  { name: "Aigerim", role: "All-round editor", look: 3, mission: { title: "Notion AI in 60 seconds", style: "Mode only", length: "0:58" }, stage: 3, progress: 0.55 },
+  { name: "Leo", role: "All-round editor", look: 4, mission: { title: "Build a landing page", style: "Mode only", length: "14:30" }, stage: 6, progress: 0.2 },
+  { name: "Mei", role: "All-round editor", look: 5, mission: { title: "Five mistakes founders make", style: "Mode only", length: "1:12" }, stage: 4, progress: 0.7 },
 ];
 
 export type ModelOption = { id: string; name: string; note: string; group: "Recommended" | "Older versions"; efforts: string[]; defaultEffort: string; usesFable?: boolean };
@@ -81,10 +81,10 @@ export const MODELS: ModelOption[] = [
 ];
 
 export const QUEUED_MISSIONS: Mission[] = [
-  { title: "Bali co-working tour", mode: "Vlog", style: "Mode only", length: "9:12" },
-  { title: "Claude for video editors", mode: "YouTube Tutorial", style: "Mode only", length: "12:44" },
-  { title: "How we price our work", mode: "YouTube Explainer", style: "Mode only", length: "7:20" },
-  { title: "Three hooks that work", mode: "Instagram Reel", style: "Mode only", length: "0:45" },
+  { title: "Bali co-working tour", style: "Mode only", length: "9:12" },
+  { title: "Claude for video editors", style: "Mode only", length: "12:44" },
+  { title: "How we price our work", style: "Mode only", length: "7:20" },
+  { title: "Three hooks that work", style: "Mode only", length: "0:45" },
 ];
 
 export const CHAT_NAMES = [

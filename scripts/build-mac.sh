@@ -29,7 +29,7 @@ cp -R library/styles "$APP/Contents/Resources/library/styles"
 DEPS="$(mktemp -d)"
 node -e '
   const p = require("./package.json");
-  const pick = ["@anthropic-ai/claude-agent-sdk", "zod"];
+  const pick = ["@anthropic-ai/claude-agent-sdk", "@simplewebauthn/server", "zod"];
   require("fs").writeFileSync(process.argv[1] + "/package.json", JSON.stringify({ private: true, type: "module", dependencies: Object.fromEntries(pick.map((k) => [k, p.dependencies[k]])) }));
 ' "$DEPS"
 (cd "$DEPS" && npm install --silent --omit=dev --omit=optional --no-audit --no-fund)

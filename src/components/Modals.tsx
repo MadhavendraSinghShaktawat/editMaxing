@@ -1,184 +1,203 @@
-import { ReactNode, useEffect, useState } from "react";
-import { LogOut, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { useEffect, useState } from "react";
+import { ArrowLeft, Bolt, ChevronDown, Clapperboard, Download, ExternalLink, Film, FileText, KeyRound, Link2, Loader2, LogOut, Move3d, Plus, RefreshCw, Scissors, Search, Send, Smartphone, Sparkles, Trash2, Type, UploadCloud, Wand2, X } from "lucide-react";
 import { TOOLS } from "../sim/data";
-import { Job, STYLE_AREAS, StoredFile, StyleRule, api, resetLabel, uploadFile } from "../sim/engine";
+import { EngineStyle, Job, STYLE_AREAS, StoredFile, StyleRule, api, resetLabel, uploadFile } from "../sim/engine";
 import { store, useStore } from "../sim/store";
-import { AttachmentStrip, formatTime, useAttachments } from "./Attach";
+import { LinkInput, Pending, formatSize, formatTime, useAttachments } from "./Attach";
 import { BoardId } from "./Hud";
-import { Icon } from "./Icon";
+import { MotionBoard, MotionPreview } from "./Motion";
 import { ModelPicker } from "./ModelPicker";
-
-function Modal({ title, onClose, children, wide }: { title: string; onClose: () => void; children: ReactNode; wide?: boolean }) {
-  useEffect(() => {
-    const key = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", key);
-    return () => window.removeEventListener("keydown", key);
-  }, [onClose]);
-  return (
-    <div className="scrim" onClick={onClose}>
-      <section className={`modal sheet ${wide ? "wide" : ""}`} role="dialog" aria-modal="true" aria-label={title} onClick={(e) => e.stopPropagation()}>
-        <div className="panel-head">
-          <b>{title}</b>
-          <button className="ghost" aria-label="Close" onClick={onClose}>
-            ×
-          </button>
-        </div>
-        <div className="parchment">{children}</div>
-      </section>
-    </div>
-  );
-}
+import { SettingsBoard } from "./Settings";
+import { Badge, Button, Confirm, Dropzone, EmptyState, FileButton, IconButton, Item, Meta, Modal, Progress, Segmented, Select } from "./ui";
 
 const JOB_DONE = new Set(["done", "failed", "cancelled"]);
 
-function JobLine({ job }: { job: Job }) {
-  if (JOB_DONE.has(job.status)) return job.error ? <p className="job bad">{job.error}</p> : null;
+/** A running job: what it's doing, how far along, and a way to stop it. */
+function JobItem({ job }: { job: Job }) {
+  if (JOB_DONE.has(job.status)) return job.error ? <Item icon={<X size={18} />} title={<span className="t-bad">Didn't finish</span>} meta={job.error} /> : null;
+  const pct = Math.round((job.progress ?? 0) * 100);
   return (
-    <div className="job">
-      <span>{job.message ?? "Queued"}</span>
-      <div className="mission-bar">
-        <i style={{ width: `${Math.round((job.progress ?? 0) * 100)}%` }} />
-      </div>
-      <button onClick={() => void store.attempt(() => api("DELETE", `/api/jobs/${job.id}`))}>Cancel</button>
-    </div>
+    <Item
+      icon={<Loader2 size={18} className="ui-spin" />}
+      title={job.message ?? "Queued"}
+      meta={<span className="t-accent">{pct}%</span>}
+      actions={<Button size="sm" variant="ghost" onClick={() => void store.attempt(() => api("DELETE", `/api/jobs/${job.id}`))}>Cancel</Button>}
+    >
+      <Progress value={job.progress ?? 0} />
+    </Item>
   );
 }
 
-function Pick({ label, accept, multiple, onFiles }: { label: string; accept?: string; multiple?: boolean; onFiles: (f: File[]) => void }) {
+/** A file being added: size, length, and live upload state. */
+function FileItem({ a, onRemove }: { a: Pending; onRemove: (id: string) => void }) {
+  const uploading = !a.error && a.progress < 1;
+  const status = a.error ? <span className="t-bad">{a.error}</span> : uploading ? <span className="t-accent">{a.source === "link" ? "Fetching…" : "Uploading…"}</span> : <span className="t-ok">Ready</span>;
   return (
-    <label className="pick-btn">
-      {label}
-      <input
-        type="file"
-        hidden
-        accept={accept}
-        multiple={multiple}
-        onChange={(e) => {
-          if (e.target.files) onFiles([...e.target.files]);
-          e.target.value = "";
-        }}
-      />
-    </label>
+    <Item
+      icon={a.thumb ? <img src={a.thumb} alt="" /> : a.source === "link" ? <Link2 size={18} /> : <Film size={18} />}
+      title={a.name}
+      meta={<Meta parts={[a.size ? formatSize(a.size) : null, a.duration ? formatTime(a.duration) : null, status]} />}
+      actions={<IconButton label={`Remove ${a.name}`} onClick={() => onRemove(a.id)}><X size={16} /></IconButton>}
+    >
+      {uploading && <Progress value={a.progress} />}
+    </Item>
   );
 }
+
+// ── New video ──────────────────────────────────────────────────
 
 export function NewMission({ onClose }: { onClose: () => void }) {
   const s = useStore();
   const styles = s.styles.filter((v) => v.status === "approved");
   const footage = useAttachments("footage");
   const refs = useAttachments("reference");
-  const [modeId, setModeId] = useState(s.modes[0]?.id ?? "");
   const [styleId, setStyleId] = useState<string | null>(null);
-  const [why, setWhy] = useState("");
   const [locale, setLocale] = useState("en-US");
-  const [drag, setDrag] = useState(false);
   const [accountId, setAccountId] = useState(s.settings.account);
   const [model, setModel] = useState(s.lastModel);
-  const [goal, setGoal] = useState("");
+  const [prompt, setPrompt] = useState("");
+  const [script, setScript] = useState<string | null>(null);
+  const [reading, setReading] = useState(false);
+  const [clientId, setClientId] = useState("");
+  const myClients = s.clients.filter((c) => c.members.includes(s.me?.id ?? "") || s.me?.role === "owner" || s.me?.role === "admin");
+  const signedIn = s.accounts.filter((a) => a.signedIn);
   const video = footage.ready()[0];
+  const owner = (id?: string | null) => s.members.find((m) => m.id === id)?.name ?? "a colleague";
+  const clips = footage.ready();
+  // A clip that failed doesn't block the start; the rest still go to the editor.
+  const footageBusy = footage.items.some((x) => !x.error && x.progress < 1);
+  const canStart = !!video && !footageBusy && !refs.busy && !reading;
+  const reference = refs.ready();
+  // Until a reference is fetched or uploaded, the ways to add one stay on screen, even beside a failed attempt.
+  const refOpen = !refs.items.some((x) => !x.error);
+  const readScript = (f: File) => void s.attempt(async () => {
+    setReading(true);
+    try {
+      if (/\.(txt|md|srt|vtt)$/i.test(f.name)) setScript(await f.text());
+      else setScript((await api<{ text: string }>("POST", "/api/text/extract", { hash: (await uploadFile(f, () => {})).hash })).text);
+    } finally {
+      setReading(false);
+    }
+  });
 
   const go = () => {
-    const title = goal.trim().slice(0, 60) || video.name.replace(/\.[^.]+$/, "").replace(/[-_]/g, " ");
-    const text = [goal.trim() || "Edit this video.", refs.items.length ? "Match the attached reference." : ""].filter(Boolean).join(" ");
-    void s.startVideo({ title, modeId, styleId, reason: why.trim() || undefined, locale }, text, [...footage.ready(), ...refs.ready()], { accountId, ...model });
+    if (!canStart) return;
+    const ask = prompt.trim();
+    const firstLine = ask.split("\n")[0].trim();
+    const title = (firstLine.length > 3 ? firstLine : video.name.replace(/\.[^.]+$/, "").replace(/[-_]/g, " ")).slice(0, 60);
+    const many = clips.length > 1 ? `There are ${clips.length} raw clips. Read them all, then build the best story from the strongest takes${script?.trim() ? ", following my script" : ""}.` : "";
+    const text = [ask || "Edit this video.", many, reference.length && !/reference/i.test(ask) ? "Match the attached reference." : ""].filter(Boolean).join("\n\n");
+    void s.startVideo({ title, styleId, locale, script: script?.trim() || undefined }, text, [...clips, ...reference], { accountId, ...model, clientId: clientId || null });
     onClose();
   };
 
   return (
-    <Modal title="New video" onClose={onClose} wide>
-      <div className="mission-flow">
-        <div
-          className={`drop ${drag ? "over" : ""} ${video ? "has" : ""}`}
-          onDragOver={(e) => {
-            e.preventDefault();
-            setDrag(true);
-          }}
-          onDragLeave={() => setDrag(false)}
-          onDrop={(e) => {
-            e.preventDefault();
-            setDrag(false);
-            footage.clear();
-            void footage.add([...e.dataTransfer.files].slice(0, 1));
-          }}
-        >
-          {footage.items.length ? (
-            <AttachmentStrip items={footage.items} onRemove={footage.remove} onRole={footage.setRole} />
-          ) : (
+    <Modal
+      title="New video"
+      onClose={onClose}
+      size="lg"
+      footer={
+        <>
+          <div className="ui-grow">
+            <Select className="sm" label="Spoken language" value={locale} onChange={setLocale}>
+              <option value="en-US">English</option>
+              <option value="en-IN">English (India)</option>
+              <option value="hi-IN">Hindi</option>
+            </Select>
+            {myClients.length > 0 && (
+              <Select className="sm" label="Client" value={clientId} onChange={setClientId}>
+                <option value="">No client</option>
+                {myClients.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </Select>
+            )}
+            {signedIn.length > 1 && (
+              <Select className="sm" label="Claude account" value={accountId} onChange={setAccountId}>
+                {signedIn.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
+              </Select>
+            )}
+            <ModelPicker model={model.model} effort={model.effort} accountId={accountId} onChange={(m, effort) => setModel({ model: m, effort })} />
+          </div>
+          <Button variant="secondary" onClick={onClose}>Cancel</Button>
+          <Button variant="primary" icon={<Sparkles size={15} />} disabled={!canStart} onClick={go}>Start edit</Button>
+        </>
+      }
+    >
+      <div className="ui-stack">
+        <div className="ui-field">
+          {footage.items.length > 1 && <span className="ui-field-label">Raw videos<em>{clips.length} of {footage.items.length} ready</em></span>}
+          {footage.items.length > 0 && <div className="ui-list nm-clips">{footage.items.map((a) => <FileItem key={a.id} a={a} onRemove={footage.remove} />)}</div>}
+          <Dropzone compact={footage.items.length > 0} icon={<Clapperboard size={footage.items.length ? 18 : 30} strokeWidth={1.6} />} title={footage.items.length ? "Add more clips" : "Drop your raw videos here"} accept="video/*" multiple onFiles={(f) => void footage.add(f)} />
+          <LinkInput label="Or paste a Google Drive file or folder, or a social video link" onLink={(u) => footage.addLink(u, true)} />
+        </div>
+
+        <div className="ui-field">
+          <span className="ui-field-label">Style</span>
+          <div className="ui-cards" role="radiogroup" aria-label="Style">
+            <StyleOption on={styleId === null} name="None" note="The editor decides" onClick={() => setStyleId(null)} />
+            {styles.map((c) => <StyleOption key={c.id} on={styleId === c.id} name={c.name} note={styleSource(c, owner)} colors={c.card.colors} thumbnail={c.thumbnail} onClick={() => setStyleId(c.id)} />)}
+          </div>
+        </div>
+
+        <div className="ui-field">
+          <span className="ui-field-label">Reference video<em>Optional</em></span>
+          {refs.items.length > 0 && <div className="ui-list nm-ref">{refs.items.map((a) => <FileItem key={a.id} a={a} onRemove={refs.remove} />)}</div>}
+          {refOpen && (
             <>
-              <Icon name="film" size={30} color="#7a4a2c" />
-              <b>Drop your raw video here</b>
-              <Pick label="or choose a file" accept="video/*" onFiles={(f) => void footage.add(f.slice(0, 1))} />
+              <Dropzone compact icon={<Film size={18} />} title="Edit it like another video" action="Choose a file" accept="video/*" onFiles={(f) => { refs.items.filter((x) => x.error).forEach((x) => refs.remove(x.id)); void refs.add(f.slice(0, 1)); }} />
+              <LinkInput label="Or paste a Drive, TikTok, Instagram or other video link" onLink={(u) => { refs.items.filter((x) => x.error).forEach((x) => refs.remove(x.id)); return refs.addLink(u); }} />
             </>
           )}
         </div>
 
-        <h3>What kind of video is this?</h3>
-        <div className="chips">
-          {s.modes.map((m) => (
-            <button key={m.id} className={modeId === m.id ? "on" : ""} title={m.rules} onClick={() => setModeId(m.id)}>
-              {m.label}
-            </button>
-          ))}
-        </div>
+        {script === null ? (
+          <div className="ui-toolbar">
+            <Button size="sm" variant="ghost" icon={<FileText size={14} />} onClick={() => setScript("")}>Add a script</Button>
+          </div>
+        ) : (
+          <div className="ui-field">
+            <span className="ui-field-label">Script<em>Optional</em></span>
+            <textarea className="ui-textarea" rows={5} value={script} placeholder="Paste your script. The editor builds the video in this order." aria-label="Script" onChange={(e) => setScript(e.target.value)} />
+            <div className="ui-toolbar">
+              <FileButton size="sm" variant="secondary" loading={reading} accept=".txt,.md,.docx,.doc,.rtf,.odt" onFiles={(f) => readScript(f[0])}>Upload</FileButton>
+              <Button size="sm" variant="ghost" onClick={() => setScript(null)}>Remove</Button>
+            </div>
+          </div>
+        )}
 
-        <h3>Pick a style</h3>
-        <div className="style-grid">
-          <button className={styleId === null ? "on" : ""} onClick={() => setStyleId(null)}>
-            <b>Mode only</b>
-            <small>No saved style</small>
-          </button>
-          {styles.map((c) => (
-            <button key={c.id} className={styleId === c.id ? "on" : ""} onClick={() => setStyleId(c.id)}>
-              <span className="swatches">
-                {(c.card.colors ?? []).slice(0, 3).map((v) => (
-                  <i key={v} style={{ background: v }} />
-                ))}
-              </span>
-              <b>{c.name}</b>
-              <small>{s.modes.find((m) => m.id === c.mode)?.label ?? "Any video"}</small>
-            </button>
-          ))}
-        </div>
-
-        <h3>Why this style? One line, and it's remembered.</h3>
-        <input className="why" value={why} placeholder="This is for skeptical founders, so keep it calm." onChange={(e) => setWhy(e.target.value)} />
-
-        <h3>Anything specific? (optional)</h3>
-        <input className="why" value={goal} placeholder="Find the strongest 45 seconds and open on the claim." onChange={(e) => setGoal(e.target.value)} />
-
-        <h3>Edit it like this video (optional)</h3>
-        <div className="ref-drop">
-          {refs.items.length ? <AttachmentStrip items={refs.items} onRemove={refs.remove} onRole={refs.setRole} /> : <Pick label="Choose a reference video" accept="video/*" onFiles={(f) => void refs.add(f.slice(0, 1))} />}
-        </div>
-
-        <div className="flow-foot">
-          <span>
-            <i className="dot" /> Autopilot on: only publishing, paying or deleting footage will stop you.
-          </span>
-          <label className="lang">
-            <span className="sr">Spoken language</span>
-            <select value={locale} onChange={(e) => setLocale(e.target.value)}>
-              <option value="en-US">English</option>
-              <option value="en-IN">English (India)</option>
-              <option value="hi-IN">Hindi</option>
-            </select>
-          </label>
-          {s.accounts.length > 1 && (
-            <select className="account-pick" aria-label="Claude account" value={accountId} onChange={(e) => setAccountId(e.target.value)}>
-              {s.accounts.filter((a) => a.signedIn).map((a) => (
-                <option key={a.id} value={a.id}>{a.label}</option>
-              ))}
-            </select>
-          )}
-          <ModelPicker model={model.model} effort={model.effort} accountId={accountId} onChange={(m, effort) => setModel({ model: m, effort })} />
-          <button className="primary" disabled={!video || footage.busy || refs.busy} onClick={go}>
-            Go
-          </button>
+        <div className="nm-prompt">
+          <textarea
+            className="ui-textarea"
+            value={prompt}
+            rows={3}
+            placeholder="Tell the editor what you want. For example: open on the strongest claim, keep it under 60 seconds, calm and premium."
+            aria-label="Your prompt"
+            onChange={(e) => setPrompt(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); go(); } }}
+          />
+          <div className="nm-prompt-foot">
+            <span>{canStart ? "⌘ Enter to start" : video ? "Waiting for uploads…" : "Add your video first"}</span>
+            <IconButton label="Start edit" disabled={!canStart} onClick={go}><Send size={15} /></IconButton>
+          </div>
         </div>
       </div>
     </Modal>
   );
 }
+
+/** Where a style came from, in a few words. */
+const styleSource = (c: EngineStyle, owner: (id?: string | null) => string) => (c.access === "repo" ? `Shared${c.author ? ` by ${c.author}` : ""}` : c.access === "use" || c.access === "edit" ? `From ${owner(c.ownerId)}` : "Your style");
+
+function StyleOption({ on, name, note, colors, thumbnail, onClick }: { on: boolean; name: string; note: string; colors?: string[]; thumbnail?: string | null; onClick: () => void }) {
+  return (
+    <button type="button" role="radio" aria-checked={on} className={`ui-card ${on ? "is-on" : ""}`} onClick={onClick}>
+      {thumbnail ? <img className="st-thumb sm" src={thumbnail} alt="" loading="lazy" /> : <span className="ui-swatch sm">{colors?.slice(0, 3).map((v) => <i key={v} style={{ background: v }} />)}</span>}
+      <b>{name}</b>
+      <small>{note}</small>
+    </button>
+  );
+}
+
+// ── Review ─────────────────────────────────────────────────────
 
 type Call = { id: number; atSeconds: number | null; text: string };
 
@@ -187,7 +206,6 @@ export function Review({ id, onClose }: { id: string; onClose: () => void }) {
   const e = s.editors.find((v) => v.id === id);
   const [outputs, setOutputs] = useState<string[]>([]);
   const [calls, setCalls] = useState<Call[]>([]);
-  const [versions, setVersions] = useState<{ version: number; note: string | null }[]>([]);
   const [note, setNote] = useState("");
   const [at, setAt] = useState(0);
   const [picked, setPicked] = useState<string | null>(null);
@@ -196,7 +214,6 @@ export function Review({ id, onClose }: { id: string; onClose: () => void }) {
     void store.attempt(async () => {
       setOutputs(await api<string[]>("GET", `/api/chats/${id}/outputs`));
       setCalls(await api<Call[]>("GET", `/api/chats/${id}/review`));
-      setVersions(await api<{ version: number; note: string | null }[]>("GET", `/api/chats/${id}/versions`));
     });
   }, [id]);
 
@@ -207,7 +224,7 @@ export function Review({ id, onClose }: { id: string; onClose: () => void }) {
   const url = (n: string) => `/api/chats/${id}/out/${encodeURIComponent(n)}`;
   const stem = current?.replace(/\.mp4$/, "");
   const seek = (t: number) => {
-    const v = document.querySelector<HTMLVideoElement>(".review video");
+    const v = document.querySelector<HTMLVideoElement>(".rv video");
     if (v) v.currentTime = t;
   };
   const submit = () => {
@@ -216,109 +233,154 @@ export function Review({ id, onClose }: { id: string; onClose: () => void }) {
     onClose();
   };
   return (
-    <Modal title={`Review · ${e.mission?.title ?? ""}`} onClose={onClose} wide>
-      <div className="review">
-        <div className="review-main">
-          {current ? <video className="player real" src={url(current)} controls onTimeUpdate={(v) => setAt(v.currentTarget.currentTime)} /> : <div className="player empty">Nothing rendered yet.</div>}
-          <form
-            className="comment"
-            onSubmit={(ev) => {
-              ev.preventDefault();
-              submit();
-            }}
-          >
-            <input value={note} placeholder={`Comment at ${formatTime(at)}…`} aria-label="Comment" onChange={(v) => setNote(v.target.value)} />
-            <button type="submit" disabled={!note.trim()}>
-              Ask for changes
-            </button>
+    <Modal title={e.mission?.title ?? "Review"} description={`Edited by ${e.name}`} onClose={onClose} size="lg">
+      <div className="rv">
+        <div>
+          {current ? <video src={url(current)} controls onTimeUpdate={(v) => setAt(v.currentTarget.currentTime)} /> : <div className="rv-empty">Nothing rendered yet</div>}
+          <form className="rv-comment" onSubmit={(ev) => (ev.preventDefault(), submit())}>
+            <input className="ui-input" value={note} placeholder={`Comment at ${formatTime(at)}`} aria-label="Comment" onChange={(v) => setNote(v.target.value)} />
+            <Button type="submit" variant="primary" icon={<Send size={14} />} disabled={!note.trim()}>Send</Button>
           </form>
         </div>
-        <div className="review-side">
-          <h3>Calls {e.name} made</h3>
-          {!calls.length && <p className="lede">No calls logged yet.</p>}
-          {calls.map((c) => (
-            <div className="call" key={c.id}>
-              {c.atSeconds !== null ? <button onClick={() => seek(c.atSeconds!)}>{formatTime(c.atSeconds)}</button> : <i />}
-              <span>{c.text}</span>
-            </div>
-          ))}
-          <h3>Versions</h3>
-          <div className="versions">
-            {videos.map((n) => (
-              <button key={n} className={n === current ? "on" : ""} onClick={() => setPicked(n)}>
-                {n.replace(".mp4", "").replace("-preview", " preview")}
-              </button>
-            ))}
-          </div>
-          {versions.length > 1 && <small className="lede">{versions.length} saved edits. Ask {e.name} to go back to any of them.</small>}
-          {current && (
-            <div className="render-links">
-              <a href={url(current)} download>MP4</a>
-              {outputs.includes(`${stem}.srt`) && <a href={url(`${stem}.srt`)} download>SRT</a>}
-              {outputs.includes(`${stem}.fcpxml`) && <a href={url(`${stem}.fcpxml`)} download>FCPXML for Resolve</a>}
+        <aside className="rv-side">
+          {videos.length > 0 && (
+            <div className="ui-field">
+              <span className="ui-field-label">Version</span>
+              <Select label="Version" value={current ?? ""} onChange={setPicked}>
+                {videos.map((n) => <option key={n} value={n}>{n.replace(".mp4", "").replace("-preview", " · preview")}</option>)}
+              </Select>
             </div>
           )}
-        </div>
+          {current && (
+            <div className="ui-field">
+              <span className="ui-field-label">Download</span>
+              <div className="ui-chips">
+                <a className="ui-btn v-secondary sm" href={url(current)} download><Download size={13} /><span>MP4</span></a>
+                {outputs.includes(`${stem}.srt`) && <a className="ui-btn v-secondary sm" href={url(`${stem}.srt`)} download><Download size={13} /><span>SRT</span></a>}
+                {outputs.includes(`${stem}.fcpxml`) && <a className="ui-btn v-secondary sm" href={url(`${stem}.fcpxml`)} download><Download size={13} /><span>Resolve</span></a>}
+              </div>
+            </div>
+          )}
+          <div className="ui-field">
+            <span className="ui-field-label">Editor's calls</span>
+            {calls.length ? (
+              <div className="rv-calls">
+                {calls.map((c) => (
+                  <button key={c.id} type="button" className="rv-call" disabled={c.atSeconds === null} onClick={() => c.atSeconds !== null && seek(c.atSeconds)}>
+                    <time>{c.atSeconds !== null ? formatTime(c.atSeconds) : "—"}</time>
+                    <span>{c.text}</span>
+                  </button>
+                ))}
+              </div>
+            ) : <span className="ui-field-hint">None yet</span>}
+          </div>
+        </aside>
       </div>
     </Modal>
   );
 }
+
+// ── Claude accounts ────────────────────────────────────────────
 
 export function Accounts({ onClose }: { onClose: () => void }) {
   const s = useStore();
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [useKey, setUseKey] = useState(false);
+  const [kind, setKind] = useState<"login" | "key">("login");
+  const [busy, setBusy] = useState(false);
   const add = () =>
     void s.attempt(async () => {
-      const a = await api<{ id: string }>("POST", "/api/accounts", { label: label.trim() || "Claude account", apiKey: useKey ? apiKey : undefined });
-      setLabel("");
-      setApiKey("");
-      if (!useKey) await api("POST", `/api/accounts/${a.id}/login`, {});
+      setBusy(true);
+      try {
+        const a = await api<{ id: string }>("POST", "/api/accounts", { label: label.trim() || "Claude account", apiKey: kind === "key" ? apiKey : undefined });
+        setLabel("");
+        setApiKey("");
+        if (kind === "login") await api("POST", `/api/accounts/${a.id}/login`, {});
+      } finally {
+        setBusy(false);
+      }
     });
   return (
-    <Modal title="Claude accounts" onClose={onClose} wide>
-      <p className="lede">Each account signs in through Claude's own login page. Dojo never sees a password or token. You choose the account for each chat, and Dojo never moves a chat between accounts.</p>
-      <div className="account-grid">
-        {s.accounts.map((a) => (
-          <article key={a.id} className="card">
-            <b>{a.label}</b>
-            <small>{a.email ?? (a.kind === "api_key" ? "API key" : a.signedIn ? "Signed in" : "Not signed in")}{a.plan ? ` · ${a.plan}` : ""}</small>
-            {a.limits.map((l) => (
-              <div key={l.id} className="limit-row">
-                <span>{l.label}</span>
-                <div className="mission-bar"><i style={{ width: `${Math.round(100 - l.usedPercent)}%` }} /></div>
-                <small>{Math.round(100 - l.usedPercent)}% left · {resetLabel(l.resetsAt)}</small>
-              </div>
-            ))}
-            {s.login?.id === a.id && s.login.status === "link" && <a className="pick-btn" href={s.login.url} target="_blank" rel="noreferrer">Open Claude sign-in</a>}
-            {s.login?.id === a.id && s.login.status === "failed" && <p className="job bad">Sign-in didn't finish.</p>}
-            <div className="card-actions">
-              <button title="Refresh" aria-label={`Refresh ${a.label}`} onClick={() => void s.attempt(() => api("POST", `/api/accounts/${a.id}/refresh`))}><RefreshCw size={14} /></button>
-              {a.kind === "subscription" && !a.signedIn && <button onClick={() => void s.attempt(() => api("POST", `/api/accounts/${a.id}/login`, {}))}>Sign in</button>}
-              {a.kind === "subscription" && a.signedIn && a.id !== "default" && <button aria-label={`Sign out of ${a.label}`} title="Sign out" onClick={() => void s.attempt(() => api("POST", `/api/accounts/${a.id}/logout`))}><LogOut size={14} /></button>}
-              {a.id !== "default" && <button aria-label={`Remove ${a.label}`} title="Remove" onClick={() => void s.attempt(() => api("DELETE", `/api/accounts/${a.id}`))}><Trash2 size={14} /></button>}
-            </div>
-          </article>
-        ))}
-        <article className="card add">
-          <b>Add an account</b>
-          <input className="why" value={label} placeholder="Studio 2" aria-label="Account name" onChange={(e) => setLabel(e.target.value)} />
-          {useKey && <input className="why" type="password" value={apiKey} placeholder="Console API key" aria-label="API key" onChange={(e) => setApiKey(e.target.value)} />}
-          <label className="check"><input type="checkbox" checked={useKey} onChange={(e) => setUseKey(e.target.checked)} /> Use a Console API key</label>
-          <button className="primary" disabled={useKey && !apiKey.trim()} onClick={add}><Plus size={15} /> {useKey ? "Add" : "Add and sign in"}</button>
-        </article>
+    <Modal title="Claude accounts" description="Pick one for each chat." onClose={onClose}>
+      <div className="ui-stack">
+        <div className="ui-list">
+          {s.accounts.map((a) => {
+            const signing = s.login?.id === a.id && s.login.status === "link";
+            return (
+              <Item
+                key={a.id}
+                icon={a.kind === "api_key" ? <KeyRound size={18} /> : <Sparkles size={18} />}
+                title={<>{a.label} {a.plan && <Badge>{a.plan}</Badge>}</>}
+                meta={<Meta parts={[a.email ?? (a.kind === "api_key" ? "API key" : null), a.signedIn ? <span className="t-ok">Signed in</span> : <span className="t-muted">Signed out</span>]} />}
+                actions={
+                  <>
+                    {a.kind === "subscription" && !a.signedIn && !signing && <Button size="sm" variant="secondary" onClick={() => void s.attempt(() => api("POST", `/api/accounts/${a.id}/login`, {}))}>Sign in</Button>}
+                    <IconButton label="Refresh usage" onClick={() => void s.attempt(() => api("POST", `/api/accounts/${a.id}/refresh`))}><RefreshCw size={15} /></IconButton>
+                    {a.kind === "subscription" && a.signedIn && a.id !== "default" && <IconButton label="Sign out" onClick={() => void s.attempt(() => api("POST", `/api/accounts/${a.id}/logout`))}><LogOut size={15} /></IconButton>}
+                    {a.id !== "default" && <Confirm icon={<Trash2 size={15} />} label={`Remove ${a.label}`} confirm="Remove" onConfirm={() => void s.attempt(() => api("DELETE", `/api/accounts/${a.id}`))} />}
+                  </>
+                }
+              >
+                {a.limits.length > 0 && (
+                  <div className="acc-limits">
+                    {a.limits.map((l) => {
+                      const left = Math.round(100 - l.usedPercent);
+                      return (
+                        <div key={l.id}>
+                          <span>{l.label}</span>
+                          <Progress value={left / 100} tone={left < 15 ? "bad" : left < 35 ? "warn" : undefined} />
+                          <small>{left}% · {resetLabel(l.resetsAt)}</small>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {signing && (
+                  <div className="acc-login">
+                    <a className="ui-btn v-primary sm" href={s.login!.url} target="_blank" rel="noreferrer"><ExternalLink size={13} /><span>Open Claude sign-in</span></a>
+                    <LoginCode id={a.id} />
+                  </div>
+                )}
+                {s.login?.id === a.id && s.login.status === "failed" && <span className="t-bad acc-note">Sign-in didn't finish. Try again.</span>}
+              </Item>
+            );
+          })}
+        </div>
+
+        <div className="ui-field">
+          <span className="ui-field-label">Add an account</span>
+          <div className="acc-add">
+            <Segmented label="Account type" value={kind} onChange={setKind} options={[{ id: "login", label: "Claude login" }, { id: "key", label: "API key" }]} />
+            <input className="ui-input" value={label} placeholder="Name, e.g. Studio 2" aria-label="Account name" onChange={(e) => setLabel(e.target.value)} />
+            {kind === "key" && <input className="ui-input" type="password" value={apiKey} placeholder="sk-ant-…" aria-label="API key" onChange={(e) => setApiKey(e.target.value)} />}
+            <Button variant="primary" icon={<Plus size={15} />} loading={busy} disabled={kind === "key" && !apiKey.trim()} onClick={add}>{kind === "key" ? "Add" : "Add and sign in"}</Button>
+          </div>
+        </div>
       </div>
     </Modal>
   );
 }
 
-function RuleList({ rules }: { rules?: StyleRule[] }) {
+/** On another computer, Claude shows a code after sign-in. It goes back to Claude Code on the Hub through here. */
+function LoginCode({ id }: { id: string }) {
+  const s = useStore();
+  const [code, setCode] = useState("");
+  return (
+    <form className="ui-inline" onSubmit={(e) => { e.preventDefault(); void s.attempt(async () => { await api("POST", `/api/accounts/${id}/login/code`, { code }); setCode(""); }); }}>
+      <input className="ui-input" value={code} placeholder="Code from Claude, if shown" aria-label="Claude sign-in code" onChange={(e) => setCode(e.target.value)} />
+      <Button type="submit" size="sm" variant="secondary" disabled={code.trim().length < 8}>Send</Button>
+    </form>
+  );
+}
+
+// ── Styles ─────────────────────────────────────────────────────
+
+function Rules({ rules }: { rules?: StyleRule[] }) {
   if (!rules?.length) return null;
   return (
-    <div className="rule-list">
+    <div className="ui-group-card">
       {rules.map((r) => (
-        <div key={r.rule} className="rule">
+        <div key={r.rule} className="sd-rule">
           <span>{r.rule}</span>
           {r.evidence && <small>{r.evidence.map((e) => formatTime(e.at)).join(", ")}{r.confidence ? ` · ${r.confidence}` : ""}</small>}
         </div>
@@ -327,69 +389,136 @@ function RuleList({ rules }: { rules?: StyleRule[] }) {
   );
 }
 
-function StylesBoard() {
+function Swatch({ colors, className = "" }: { colors?: string[]; className?: string }) {
+  return <span className={`ui-swatch ${className}`}>{colors?.slice(0, 3).map((v) => <i key={v} style={{ background: v }} />)}</span>;
+}
+
+function StylesBoard({ onClose, onMotion }: { onClose: () => void; onMotion: () => void }) {
   const s = useStore();
   const [open, setOpen] = useState<string | null>(null);
   const [job, setJob] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+  const owner = (id?: string | null) => s.members.find((m) => m.id === id)?.name ?? "a colleague";
   const start = (f: File) =>
     void s.attempt(async () => {
-      const stored = await uploadFile(f, () => {});
-      const r = await api<{ job: string }>("POST", "/api/styles/learn", { hash: stored.hash, accountId: s.settings.account });
-      setJob(r.job);
+      setAdding(true);
+      try {
+        const stored = await uploadFile(f, () => {});
+        const r = await api<{ job: string }>("POST", "/api/styles/learn", { hash: stored.hash, accountId: s.settings.account });
+        setJob(r.job);
+      } finally {
+        setAdding(false);
+      }
     });
+  /** Learn a style straight from a social link, downloaded through the person's Scrape Creators key. */
+  const fromLink = async (url: string) => {
+    const r = await api<{ file: StoredFile; platform: string }>("POST", "/api/links/fetch", { url });
+    const j = await api<{ job: string }>("POST", "/api/styles/learn", { hash: r.file.hash, accountId: s.settings.account });
+    setJob(j.job);
+  };
+  const linkInput = <LinkInput label="Or paste a Drive, reel or TikTok link to learn from" onLink={fromLink} />;
   const running = job ? s.jobs.get(job) : null;
   const shown = s.styles.find((v) => v.id === open);
+  const learn = (variant: "primary" | "light") => (
+    <FileButton variant={variant} size={variant === "light" ? "md" : "sm"} icon={<Plus size={15} />} loading={adding} accept="video/*" onFiles={(f) => start(f[0])} title={`Claude Opus studies it on ${s.activeAccount()?.label ?? "your"} account`}>
+      New style
+    </FileButton>
+  );
+
   if (shown) {
+    const areas = STYLE_AREAS.filter(([id]) => shown.card[id]?.summary);
+    const source = styleSource(shown, owner);
+    const saved = s.motion.filter((v) => v.styleId === shown.id);
+    const animations = saved.filter((v) => v.kind === "animation");
+    const caption = saved.find((v) => v.kind === "caption");
     return (
-      <div className="style-detail">
-        <button className="back" onClick={() => setOpen(null)}>Back to styles</button>
-        <h3>{shown.name} {shown.status === "draft" && <em>Draft</em>}{shown.shared && <em>Shared{shown.author ? ` by ${shown.author}` : ""}</em>}</h3>
-        <p className="lede">{shown.card.summary}</p>
-        {shown.card.structure && <p>{shown.card.structure}</p>}
-        {STYLE_AREAS.some(([id]) => shown.card[id]?.summary) ? STYLE_AREAS.filter(([id]) => shown.card[id]?.summary).map(([id, label]) => (
-          <section key={id}>
-            <h3>{label}</h3>
-            <p className="lede">{shown.card[id]!.summary}</p>
-            <RuleList rules={shown.card[id]!.rules} />
-          </section>
-        )) : <RuleList rules={shown.card.rules} />}
-        {!!shown.card.anyPerson?.length && <><h3>On someone else's footage</h3>{shown.card.anyPerson.map((u) => <p key={u} className="lede">{u}</p>)}</>}
-        {!!shown.card.unsure?.length && <><h3>What Claude couldn't confirm</h3>{shown.card.unsure.map((u) => <p key={u} className="lede">{u}</p>)}</>}
-        {!!shown.card.rejected?.length && <><h3>Rules dropped by the evidence check</h3>{shown.card.rejected.map((u) => <p key={u.rule} className="lede">{u.rule}: {u.reason}</p>)}</>}
-        <div className="flow-foot">
-          {!shown.shared && <button className="ghost-btn" onClick={() => { void s.attempt(() => api("DELETE", `/api/styles/${shown.id}`)); setOpen(null); }}>Delete</button>}
-          {shown.status === "draft" && <button className="primary" onClick={() => void s.attempt(() => api("PATCH", `/api/styles/${shown.id}`, { status: "approved" }))}>Approve this style</button>}
+      <Modal
+        title="Styles"
+        onClose={onClose}
+        size="lg"
+        footer={
+          <>
+            <div className="ui-grow"><Button variant="ghost" icon={<ArrowLeft size={15} />} onClick={() => setOpen(null)}>All styles</Button></div>
+            {shown.access === "own" && <Confirm size="md" icon={<Trash2 size={15} />} confirm="Delete style" onConfirm={() => { void s.attempt(() => api("DELETE", `/api/styles/${shown.id}`)); setOpen(null); }}>Delete</Confirm>}
+            {shown.status === "draft" && (shown.access === "own" || shown.access === "edit") && <Button variant="primary" onClick={() => void s.attempt(() => api("PATCH", `/api/styles/${shown.id}`, { status: "approved" }))}>Approve</Button>}
+          </>
+        }
+      >
+        <div className="sd-head">
+          {shown.thumbnail ? <img className="st-thumb" src={shown.thumbnail} alt={`${shown.name} thumbnail`} /> : <Swatch colors={shown.card.colors} />}
+          <div>
+            <h3>{shown.name} {shown.status === "draft" && <Badge tone="warn">Draft</Badge>}</h3>
+            <p><Meta parts={[source, shown.access === "own" && shown.shared ? "Shared" : null]} /></p>
+          </div>
         </div>
-      </div>
+        {shown.card.summary && <p className="sd-summary">{shown.card.summary}</p>}
+        <div className="ui-stack">
+          {(animations.length > 0 || caption) && (
+            <section className="ui-group">
+              <div className="ui-group-head"><h3>Saved from the reference</h3><Button size="sm" variant="ghost" onClick={onMotion}>Motion library</Button></div>
+              <div className="mo-grid sm">
+                {caption && <div className="mo-card static"><MotionPreview item={caption} /><span className="mo-card-body"><b>Captions</b><small>{String((caption.card.captions as { fontFeel?: string } | undefined)?.fontFeel ?? "Caption preset")}</small></span></div>}
+                {animations.map((v) => <div key={v.id} className="mo-card static"><MotionPreview item={v} /><span className="mo-card-body"><b>{v.name}</b><small>{[v.operation?.label, v.technique?.label].filter(Boolean).join(" → ")}</small></span></div>)}
+              </div>
+            </section>
+          )}
+          {areas.length ? areas.map(([id, label]) => (
+            <section key={id} className="ui-group">
+              <div className="ui-group-head"><h3>{label}</h3></div>
+              {shown.card[id]!.summary && <p className="sd-summary" style={{ margin: "0 4px 10px", fontSize: 13 }}>{shown.card[id]!.summary}</p>}
+              <Rules rules={shown.card[id]!.rules} />
+            </section>
+          )) : <Rules rules={shown.card.rules} />}
+          {!!shown.card.anyPerson?.length && <Disclosure title="On other people's footage" items={shown.card.anyPerson} />}
+          {!!shown.card.unsure?.length && <Disclosure title="Not confirmed" items={shown.card.unsure} />}
+          {!!shown.card.rejected?.length && <Disclosure title="Dropped by evidence check" items={shown.card.rejected.map((u) => `${u.rule}: ${u.reason}`)} />}
+        </div>
+      </Modal>
     );
   }
+
   return (
-    <>
-      <p className="lede">{s.styles.length ? "Your saved editing styles. Add a reference video and Claude studies it once. Nothing goes live until you approve it." : "No styles yet. They're all yours to make: add a reference video and Claude studies it. Nothing goes live until you approve it."}</p>
-      {running && <JobLine job={running} />}
-      <div className="board-grid">
-        {s.styles.map((c) => (
-          <button key={c.id} className="card" onClick={() => setOpen(c.id)}>
-            <span className="swatches big">
-              {(c.card.colors ?? []).slice(0, 3).map((v) => (
-                <i key={v} style={{ background: v }} />
+    <Modal title="Styles" description="Learned from reference videos." onClose={onClose} size="lg">
+      <div className="ui-stack">
+        {running && <div className="ui-list"><JobItem job={running} /></div>}
+        {s.styles.length ? (
+          <>
+            <div className="ui-toolbar"><span>{s.styles.length} {s.styles.length === 1 ? "style" : "styles"}</span>{learn("primary")}</div>
+            {linkInput}
+            <div className="ui-cards wide">
+              {s.styles.map((c) => (
+                <button key={c.id} type="button" className="ui-card" onClick={() => setOpen(c.id)}>
+                  {c.thumbnail ? <img className="st-thumb" src={c.thumbnail} alt="" loading="lazy" /> : <Swatch colors={c.card.colors} />}
+                  <b>{c.name}</b>
+                  <small>{c.status === "draft" ? <span className="t-warn">Draft</span> : styleSource(c, owner)}</small>
+                  {c.card.summary && <p>{c.card.summary}</p>}
+                </button>
               ))}
-            </span>
-            <b>{c.name}</b>
-            <small>{c.status === "draft" ? "Draft, needs approval" : c.shared ? `Shared${c.author ? ` by ${c.author}` : ""}` : (s.modes.find((m) => m.id === c.mode)?.label ?? "Any video")}</small>
-            <p>{c.card.summary}</p>
-          </button>
-        ))}
-        <article className="card add">
-          <Icon name="film" size={24} color="#7a4a2c" />
-          <b>Learn from a reference</b>
-          <p>Uses Opus on your {s.activeAccount()?.label ?? "default"} account.</p>
-          <Pick label="Choose a video" accept="video/*" onFiles={(f) => start(f[0])} />
-        </article>
+            </div>
+          </>
+        ) : (
+          !running && (
+            <>
+              <EmptyState art="grid" title="No styles yet" text="Add a reference video and Claude learns its style." action={learn("light")} />
+              {linkInput}
+            </>
+          )
+        )}
       </div>
-    </>
+    </Modal>
   );
 }
+
+function Disclosure({ title, items }: { title: string; items: string[] }) {
+  return (
+    <details className="ui-details">
+      <summary>{title} <Badge>{items.length}</Badge><ChevronDown size={15} /></summary>
+      <div>{items.map((u) => <span key={u} className="ui-row-meta">{u}</span>)}</div>
+    </details>
+  );
+}
+
+// ── Prompt recipes ─────────────────────────────────────────────
 
 function PromptsBoard({ onClose }: { onClose: () => void }) {
   const s = useStore();
@@ -401,81 +530,109 @@ function PromptsBoard({ onClose }: { onClose: () => void }) {
     if (!s.selectedId && s.editors[0]) s.select(s.editors[0].id);
     onClose();
   };
+  const save = () => void s.attempt(async () => { await api("POST", "/api/recipes", { title, text }); setTitle(""); setText(""); });
   return (
-    <div className="recipe-list">
-      {s.recipes.map((p) => (
-        <article key={p.id} className="recipe">
-          <button className="recipe-use" onClick={() => use(p.id, p.text)}>
-            <b>{p.title}</b>
-            <p>{p.text}</p>
-          </button>
-          <span>{p.uses} uses</span>
-          <button className="icon-btn" aria-label={`Delete ${p.title}`} onClick={() => void s.attempt(async () => { await api("DELETE", `/api/recipes/${p.id}`); await s.refresh(); })}><Trash2 size={14} /></button>
-        </article>
-      ))}
-      <form
-        className="recipe-add"
-        onSubmit={(e) => {
-          e.preventDefault();
-          void s.attempt(async () => {
-            await api("POST", "/api/recipes", { title, text });
-            setTitle("");
-            setText("");
-          });
-        }}
-      >
-        <input className="why" value={title} placeholder="Recipe name" aria-label="Recipe name" onChange={(e) => setTitle(e.target.value)} />
-        <input className="why" value={text} placeholder="What should the editor do?" aria-label="Recipe text" onChange={(e) => setText(e.target.value)} />
-        <button className="primary" disabled={!title.trim() || !text.trim()}>Save</button>
-      </form>
-    </div>
+    <Modal title="Prompt recipes" description="Reusable instructions. Click one to use it." onClose={onClose}>
+      <div className="ui-stack">
+        {s.recipes.length ? (
+          <div className="ui-list">
+            {s.recipes.map((p) => (
+              <Item
+                key={p.id}
+                icon={<FileText size={18} />}
+                title={<>{p.title} {p.uses > 0 && <Badge>{p.uses}×</Badge>}</>}
+                meta={<span className="clamp-1">{p.text}</span>}
+                onClick={() => use(p.id, p.text)}
+                actions={<Confirm icon={<Trash2 size={15} />} label={`Delete ${p.title}`} confirm="Delete" onConfirm={() => void s.attempt(async () => { await api("DELETE", `/api/recipes/${p.id}`); await s.refresh(); })} />}
+              />
+            ))}
+          </div>
+        ) : (
+          <EmptyState title="No recipes yet" text="Save instructions you give often." />
+        )}
+        <form className="ui-field" onSubmit={(e) => (e.preventDefault(), title.trim() && text.trim() && save())}>
+          <span className="ui-field-label">New recipe</span>
+          <input className="ui-input" value={title} placeholder="Name" aria-label="Recipe name" onChange={(e) => setTitle(e.target.value)} />
+          <textarea className="ui-textarea" value={text} rows={3} placeholder="What should the editor do?" aria-label="Recipe text" onChange={(e) => setText(e.target.value)} />
+          <div className="ui-toolbar end"><Button type="submit" variant="primary" disabled={!title.trim() || !text.trim()}>Save recipe</Button></div>
+        </form>
+      </div>
+    </Modal>
   );
 }
 
-function ToolCard({ t }: { t: (typeof TOOLS)[number] }) {
+// ── Tools ──────────────────────────────────────────────────────
+
+const TOOL_ICONS: Record<string, React.ReactNode> = {
+  removeBackground: <Wand2 size={18} />, transcribe: <Type size={18} />, cutSilences: <Scissors size={18} />,
+  reframe: <Smartphone size={18} />, parallax: <Move3d size={18} />, track: <Bolt size={18} />,
+};
+
+function ToolItem({ t }: { t: (typeof TOOLS)[number] }) {
   const s = useStore();
   const [job, setJob] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const running = job ? s.jobs.get(job) : null;
   const pack = "pack" in t ? s.packs.find((p) => p.id === t.pack) : null;
   const result = (running?.status === "done" ? running.result : null) as { file?: StoredFile; words?: unknown[] } | null;
+  const active = running && !JOB_DONE.has(running.status);
   const run = (f: File) =>
     void s.attempt(async () => {
       setAdding(true);
-      const stored = await uploadFile(f, () => {}).finally(() => setAdding(false));
-      const r = await api<{ job: string }>("POST", `/api/tools/${t.id}`, { hash: stored.hash, ...t.params });
-      setJob(r.job);
+      try {
+        const stored = await uploadFile(f, () => {});
+        const r = await api<{ job: string }>("POST", `/api/tools/${t.id}`, { hash: stored.hash, ...t.params });
+        setJob(r.job);
+      } finally {
+        setAdding(false);
+      }
     });
   return (
-    <article className="card">
-      <Icon name={t.icon} size={24} color="#1f8c7f" />
-      <b>{t.name}</b>
-      <p>{t.note}</p>
-      <small>{t.tag}</small>
-      {pack && !pack.installed ? <PackButton id={pack.id} name={pack.name} /> : <Pick label={adding ? "Adding…" : "Choose a file"} accept="video/*,image/*" onFiles={(f) => run(f[0])} />}
-      {running && <JobLine job={running} />}
-      {result?.file && <a className="pick-btn" href={`/api/files/${result.file.hash}`} download={result.file.name}>Save {result.file.name}</a>}
-      {result?.words && <small>{result.words.length} words transcribed</small>}
-    </article>
+    <Item
+      icon={TOOL_ICONS[t.id] ?? <Sparkles size={18} />}
+      title={t.name}
+      meta={active ? <span className="t-accent">{running.message ?? "Working…"}</span> : result?.words ? <span className="t-ok">{result.words.length} words</span> : running?.error ? <span className="t-bad">{running.error}</span> : t.note}
+      actions={
+        result?.file ? (
+          <a className="ui-btn v-secondary sm" href={`/api/files/${result.file.hash}`} download={result.file.name}><Download size={13} /><span>Save</span></a>
+        ) : pack && !pack.installed ? (
+          <PackButton id={pack.id} name={pack.name} />
+        ) : (
+          <FileButton size="sm" variant="secondary" loading={adding || !!active} accept="video/*,image/*" onFiles={(f) => run(f[0])}>Run</FileButton>
+        )
+      }
+    >
+      {active && <Progress value={running.progress ?? 0} />}
+    </Item>
   );
 }
 
-function PackButton({ id, name }: { id: string; name: string }) {
+export function PackButton({ id, name }: { id: string; name: string }) {
   const s = useStore();
   const [job, setJob] = useState<string | null>(null);
   const running = job ? s.jobs.get(job) : null;
   useEffect(() => {
     if (running?.status === "done") void s.refresh();
   }, [running?.status, s]);
-  if (running) return <JobLine job={running} />;
+  const active = !!running && !JOB_DONE.has(running.status);
   return (
-    <button className="pick-btn" onClick={() => void s.attempt(async () => setJob((await api<{ job: string }>("POST", `/api/packs/${id}/install`)).job))}>
-      Install {name}
-    </button>
+    <Button size="sm" variant="secondary" icon={<Download size={13} />} loading={active} title={`Install ${name}`} onClick={() => void s.attempt(async () => setJob((await api<{ job: string }>("POST", `/api/packs/${id}/install`)).job))}>
+      {active ? `${Math.round((running!.progress ?? 0) * 100)}%` : "Install"}
+    </Button>
   );
 }
 
-function LibraryBoard() {
+function ToolsBoard({ onClose }: { onClose: () => void }) {
+  return (
+    <Modal title="Tools" description="Runs on this Mac. No Claude usage." onClose={onClose}>
+      <div className="ui-list">{TOOLS.map((t) => <ToolItem key={t.id} t={t} />)}</div>
+    </Modal>
+  );
+}
+
+// ── B-roll library ─────────────────────────────────────────────
+
+function LibraryBoard({ onClose }: { onClose: () => void }) {
   const s = useStore();
   const lib = s.library;
   const [links, setLinks] = useState("");
@@ -484,6 +641,12 @@ function LibraryBoard() {
   const [data, setData] = useState<{ tree: { path: string; count: number }[]; gaps: string[] }>({ tree: [], gaps: [] });
   const [shots, setShots] = useState<{ id: string; summary: string; implies: string[]; category: string | null }[]>([]);
   const [uploading, setUploading] = useState(0);
+  const [naming, setNaming] = useState(false);
+  const [newName, setNewName] = useState("");
+  const writable = s.libraries.filter((l) => l.access === "own" || l.access === "add");
+  const [target, setTarget] = useState<string | null>(null);
+  const into = target && writable.some((l) => l.id === target) ? target : writable[0]?.id ?? null;
+  const ownerName = (id: string) => s.members.find((m) => m.id === id)?.name ?? "a colleague";
   const active = [...s.jobs.values()].filter((j) => j.kind.startsWith("library.") && !JOB_DONE.has(j.status));
 
   useEffect(() => {
@@ -497,151 +660,120 @@ function LibraryBoard() {
   const importFiles = (files: File[]) =>
     void s.attempt(async () => {
       setUploading(files.length);
-      for (const f of files) {
-        const stored = await uploadFile(f, () => {});
-        await api("POST", "/api/library/import", { hashes: [stored.hash] });
-        setUploading((n) => n - 1);
+      try {
+        for (const f of files) {
+          const stored = await uploadFile(f, () => {});
+          await api("POST", "/api/library/import", { hashes: [stored.hash], libraryId: into });
+          setUploading((n) => n - 1);
+        }
+      } finally {
+        setUploading(0);
       }
     });
+  const makeLibrary = () => void s.attempt(async () => {
+    const l = await api<{ id: string }>("POST", "/api/libraries", { name: newName });
+    setNewName("");
+    setNaming(false);
+    await s.refresh();
+    setTarget(l.id);
+  });
   const pending = lib?.pending ?? 0;
   const counts = [...new Set([10, 25, 50, pending].filter((n) => n > 0 && n <= pending))];
-  const estimate = lib?.percentPerShot ? `About ${Math.max(1, Math.round(lib.percentPerShot * count))}% of your session` : "Run 10 first to measure the usage";
+  const pick = counts.includes(count) ? count : counts[0];
+  const estimate = lib?.percentPerShot ? `≈ ${Math.max(1, Math.round(lib.percentPerShot * pick))}% of your session` : null;
 
   return (
-    <>
-      <div className="import">
-        <div>
-          <b>{lib?.clips ?? 0} clips · {lib?.shots ?? 0} shots · {lib?.analyzed ?? 0} analyzed</b>
-          <p>{pending ? `${pending} shots are waiting for Claude. ${estimate}.` : "Every shot has been analyzed."} Batches grow 10, 20, 30, 40, and pause while editors work.</p>
+    <Modal title="B-roll library" onClose={onClose} size="lg">
+      <div className="ui-stack">
+        <div className="ui-toolbar">
+          {naming ? (
+            <form className="ui-inline grow" onSubmit={(e) => (e.preventDefault(), newName.trim() && makeLibrary())}>
+              <input className="ui-input" autoFocus value={newName} placeholder="Library name" aria-label="New library name" onChange={(e) => setNewName(e.target.value)} onKeyDown={(e) => e.key === "Escape" && (e.stopPropagation(), setNaming(false))} />
+              <Button type="submit" variant="primary" size="sm" disabled={!newName.trim()}>Create</Button>
+              <Button variant="ghost" size="sm" onClick={() => setNaming(false)}>Cancel</Button>
+            </form>
+          ) : (
+            <>
+              <Select className="sm" label="Library" value={into ?? ""} onChange={setTarget}>
+                {writable.map((l) => <option key={l.id} value={l.id}>{l.name}{l.ownerId !== s.me?.id ? ` · ${ownerName(l.ownerId)}` : ""}</option>)}
+              </Select>
+              <Button variant="ghost" size="sm" icon={<Plus size={14} />} onClick={() => setNaming(true)}>New library</Button>
+            </>
+          )}
         </div>
+
+        <div className="ui-stats">
+          <div className="ui-stat"><b>{lib?.clips ?? 0}</b><span>Clips</span></div>
+          <div className="ui-stat"><b>{lib?.shots ?? 0}</b><span>Shots</span></div>
+          <div className="ui-stat"><b>{lib?.analyzed ?? 0}</b><span>Analyzed</span></div>
+        </div>
+
         {pending > 0 && (
-          <div className="import-pick">
-            {counts.map((n) => (
-              <button key={n} className={count === n ? "on" : ""} onClick={() => setCount(n)}>{n === pending ? `All ${n}` : n}</button>
-            ))}
-            <button className="primary" onClick={() => void s.attempt(() => api("POST", "/api/library/analyze", { count: Math.min(count, pending), accountId: s.settings.account }))}>Analyze</button>
+          <div className="ui-callout lb-analyze">
+            <Sparkles size={17} />
+            <span><b>{pending} shots</b> ready to analyze{estimate && <span className="t-muted"> · {estimate}</span>}</span>
+            {counts.length > 1 && <Segmented label="How many" value={String(pick)} onChange={(v) => setCount(Number(v))} options={counts.map((n) => ({ id: String(n), label: n === pending ? "All" : String(n) }))} />}
+            <Button variant="primary" size="sm" onClick={() => void s.attempt(() => api("POST", "/api/library/analyze", { count: Math.min(pick, pending), accountId: s.settings.account }))}>Analyze</Button>
           </div>
         )}
-      </div>
-      {active.map((j) => <JobLine key={j.id} job={j} />)}
-      {!s.keys.openrouter && <p className="lede">Keyword search works now. Add an OpenRouter key in Settings for meaning search, where "hard work" can find a late-night desk.</p>}
-      <div className="import-row">
-        <Pick label={uploading ? `Adding ${uploading}…` : "Add videos"} accept="video/*" multiple onFiles={importFiles} />
-        <textarea value={links} rows={2} placeholder="Paste Google Drive links set to Anyone with the link, one per line" aria-label="Google Drive links" onChange={(e) => setLinks(e.target.value)} />
-        <button className="primary" disabled={!links.trim()} onClick={() => void s.attempt(async () => { await api("POST", "/api/library/drive", { links: links.split(/\s+/).filter(Boolean) }); setLinks(""); })}>Import</button>
-      </div>
-      <div className="chips">
-        {path && <button onClick={() => setPath(path.split(" / ").slice(0, -1).join(" / "))}>Back</button>}
-        {data.tree.map((t) => (
-          <button key={t.path} onClick={() => setPath(t.path)}>{t.path.split(" / ").pop()} · {t.count}</button>
-        ))}
-      </div>
-      <div className="library-grid">
-        {shots.map((c) => (
-          <article key={c.id} className="clip">
-            <img src={`/api/library/shots/${c.id}/filmstrip`} alt="" loading="lazy" />
-            <span>{c.implies.slice(0, 3).join(", ") || c.summary}</span>
-          </article>
-        ))}
-      </div>
-      {data.gaps.length > 0 && (
-        <>
-          <h3>Footage you're missing</h3>
-          {data.gaps.slice(0, 5).map((g) => <p key={g} className="lede">{g}</p>)}
-        </>
-      )}
-    </>
-  );
-}
+        {active.length > 0 && <div className="ui-list">{active.map((j) => <JobItem key={j.id} job={j} />)}</div>}
 
-const KEYS = [
-  { id: "openrouter", name: "OpenRouter", note: "Embeddings for B-roll meaning search. Text only." },
-  { id: "google_api_key", name: "Google", note: "Needed only for Drive folder links." },
-  { id: "epidemic", name: "Epidemic Sound", note: "Music and effects. Downloads need your paid plan." },
-];
-
-type Doctor = Record<string, { ok: boolean; detail: string }> & { freeDiskGB: never };
-
-function SettingsBoard() {
-  const s = useStore();
-  const [values, setValues] = useState<Record<string, string>>({});
-  const [doctor, setDoctor] = useState<Doctor | null>(null);
-  const [editing, setEditing] = useState<Record<string, string>>({});
-  useEffect(() => {
-    void store.attempt(async () => setDoctor(await api<Doctor>("GET", "/api/doctor")));
-  }, []);
-  const saveKey = (id: string) =>
-    void s.attempt(async () => {
-      await api("POST", `/api/keys/${id}`, { value: values[id] });
-      setValues({ ...values, [id]: "" });
-      await s.refresh();
-    });
-  return (
-    <div className="settings">
-      <h3>Connections</h3>
-      <p className="lede">Keys are kept in your Mac's Keychain and never shown again.</p>
-      {KEYS.map((k) => (
-        <div className="setting-row" key={k.id}>
-          <div>
-            <b>{k.name} {s.keys[k.id] && <em>Connected</em>}</b>
-            <small>{k.note}</small>
-          </div>
-          <input className="why" type="password" value={values[k.id] ?? ""} placeholder={s.keys[k.id] ? "Replace key" : "Paste key"} aria-label={`${k.name} key`} onChange={(e) => setValues({ ...values, [k.id]: e.target.value })} />
-          <button className="primary" disabled={!values[k.id]?.trim()} onClick={() => saveKey(k.id)}>Save</button>
-          {s.keys[k.id] && <button className="icon-btn" aria-label={`Remove ${k.name} key`} onClick={() => void s.attempt(async () => { await api("DELETE", `/api/keys/${k.id}`); await s.refresh(); })}><Trash2 size={14} /></button>}
-        </div>
-      ))}
-      <h3>Tool packs</h3>
-      {s.packs.map((p) => (
-        <div className="setting-row" key={p.id}>
-          <div>
-            <b>{p.name} {p.installed && <em>Installed</em>}</b>
-            <small>{p.about} {p.size}.</small>
-          </div>
-          {!p.installed && <PackButton id={p.id} name={p.name} />}
-        </div>
-      ))}
-      <h3>Personal Memory</h3>
-      <p className="lede">When you correct an editor the same way twice, it becomes a rule. Text inside footage can never become one.</p>
-      {!s.memory.length && <p className="lede">Nothing learned yet.</p>}
-      {s.memory.map((r) => (
-        <div className="setting-row" key={r.id}>
-          <input className="why" value={editing[r.id] ?? r.text} aria-label="Memory rule" onChange={(e) => setEditing({ ...editing, [r.id]: e.target.value })} onBlur={() => editing[r.id] && void s.attempt(() => api("PATCH", `/api/memory/${r.id}`, { text: editing[r.id] }))} />
-          <button className="icon-btn" aria-label="Remove rule" onClick={() => void s.attempt(async () => { await api("DELETE", `/api/memory/${r.id}`); await s.refresh(); })}><Trash2 size={14} /></button>
-        </div>
-      ))}
-      <h3>This Mac</h3>
-      {doctor && ["claude", "ffmpeg", "native", "python"].map((k) => (
-        <div className="setting-row" key={k}>
-          <div>
-            <b>{k === "native" ? "Native tools" : k[0].toUpperCase() + k.slice(1)} {doctor[k].ok && <em>Ready</em>}</b>
-            <small>{doctor[k].detail}</small>
+        <div>
+          <Dropzone icon={<UploadCloud size={30} strokeWidth={1.6} />} title={uploading ? `Adding ${uploading} ${uploading === 1 ? "video" : "videos"}…` : "Drop videos here"} accept="video/*" multiple disabled={!into || uploading > 0} onFiles={importFiles} />
+          <div className="ui-hints">
+            <span>{s.keys.openrouter ? "Meaning search on" : <><Search size={12} /> Keyword search only. Add OpenRouter in Settings for meaning search.</>}</span>
           </div>
         </div>
-      ))}
-    </div>
-  );
-}
 
-const TITLES: Record<BoardId, string> = { styles: "Styles", prompts: "Prompt recipes", library: "B-roll library", tools: "Tool shelf", settings: "Settings" };
+        <details className="ui-details">
+          <summary><ExternalLink size={15} /> Import from Google Drive<ChevronDown size={15} /></summary>
+          <div>
+            <textarea className="ui-textarea" value={links} rows={3} placeholder="One link per line. Set to Anyone with the link." aria-label="Google Drive links" onChange={(e) => setLinks(e.target.value)} />
+            <div className="ui-toolbar end">
+              <Button variant="primary" size="sm" disabled={!links.trim() || !into} onClick={() => void s.attempt(async () => { await api("POST", "/api/library/drive", { links: links.split(/\s+/).filter(Boolean), libraryId: into }); setLinks(""); })}>Import</Button>
+            </div>
+          </div>
+        </details>
 
-export function Board({ id, onClose }: { id: BoardId; onClose: () => void }) {
-  return (
-    <Modal title={TITLES[id]} onClose={onClose} wide={id !== "prompts"}>
-      {id === "styles" && <StylesBoard />}
-      {id === "prompts" && <PromptsBoard onClose={onClose} />}
-      {id === "library" && <LibraryBoard />}
-      {id === "settings" && <SettingsBoard />}
-      {id === "tools" && (
-        <>
-          <p className="lede">These tools run on your Mac and use no Claude allowance.</p>
-          <div className="board-grid">
-            {TOOLS.map((t) => (
-              <ToolCard key={t.id} t={t} />
+        {(data.tree.length > 0 || path) && (
+          <div className="ui-field">
+            <span className="ui-field-label">{path ? path.split(" / ").pop() : "Browse"}</span>
+            <div className="ui-chips">
+              {path && <button type="button" className="ui-chip" onClick={() => setPath(path.split(" / ").slice(0, -1).join(" / "))}><ArrowLeft size={13} /> Back</button>}
+              {data.tree.map((t) => <button key={t.path} type="button" className="ui-chip" onClick={() => setPath(t.path)}>{t.path.split(" / ").pop()}<small>{t.count}</small></button>)}
+            </div>
+          </div>
+        )}
+        {shots.length > 0 && (
+          <div className="lb-grid">
+            {shots.map((c, i) => (
+              <article key={c.id} className="lb-clip" style={{ animationDelay: `${Math.min(i, 12) * 24}ms` }}>
+                <img src={`/api/library/shots/${c.id}/filmstrip`} alt="" loading="lazy" />
+                <span title={c.summary}>{c.implies.slice(0, 3).join(", ") || c.summary}</span>
+              </article>
             ))}
           </div>
-        </>
-      )}
+        )}
+        {data.gaps.length > 0 && (
+          <section className="ui-group">
+            <div className="ui-group-head"><h3>Missing footage</h3></div>
+            <div className="ui-group-card">{data.gaps.slice(0, 5).map((g) => <div key={g} className="sd-rule">{g}</div>)}</div>
+          </section>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+export function Board({ id, onClose, onBoard }: { id: BoardId; onClose: () => void; onBoard: (b: BoardId) => void }) {
+  if (id === "styles") return <StylesBoard onClose={onClose} onMotion={() => onBoard("motion")} />;
+  if (id === "motion") return <MotionBoard onClose={onClose} />;
+  if (id === "prompts") return <PromptsBoard onClose={onClose} />;
+  if (id === "library") return <LibraryBoard onClose={onClose} />;
+  if (id === "tools") return <ToolsBoard onClose={onClose} />;
+  return (
+    <Modal bare size="xl" label="Settings" onClose={onClose}>
+      <SettingsBoard />
     </Modal>
   );
 }

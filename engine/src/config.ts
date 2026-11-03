@@ -18,6 +18,7 @@ export const DIRS = {
   library: join(HOME, "library"),
   tmp: join(HOME, "tmp"),
   styles: join(HOME, "styles"),
+  motion: join(HOME, "motion"),
 };
 
 /** Styles the maintainers have chosen to share with everyone. Empty until one is added. */

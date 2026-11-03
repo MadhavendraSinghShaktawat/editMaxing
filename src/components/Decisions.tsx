@@ -1,8 +1,9 @@
 import { useState } from "react";
 import { EngineDecision } from "../sim/engine";
 import { store } from "../sim/store";
+import { MotionPreview } from "./Motion";
 
-type Option = { label: string; detail?: string; description?: string; shotId?: string; summary?: string; seconds?: number };
+type Option = { label: string; detail?: string; description?: string; shotId?: string; animationId?: string; technique?: string | null; summary?: string; seconds?: number };
 type Question = { question: string; header?: string; options: Option[]; multiSelect?: boolean };
 
 /** Claude's AskUserQuestion: one or more questions, answered together. */
@@ -39,17 +40,20 @@ function QuestionCard({ d }: { d: EngineDecision }) {
 function ChoiceCard({ d, editorName }: { d: EngineDecision; editorName: string }) {
   const { question, line, options } = d.payload as { question: string; line?: string; options: Option[] };
   const broll = d.kind === "broll";
+  const motion = d.kind === "motion";
   return (
     <div className="decision">
       <div className="decision-head">
-        <span>{broll ? "Pick a B-roll" : "Your call"}</span>
+        <span>{broll ? "Pick a B-roll" : motion ? "Pick an animation" : "Your call"}</span>
         {line ? <q>{line}</q> : <p>{question}</p>}
       </div>
-      <div className={broll ? "decision-options real" : "decision-list"}>
+      <div className={broll || motion ? "decision-options real" : "decision-list"}>
         {options.map((o) => (
-          <button key={o.label} onClick={() => store.answer(d.id, { label: o.label, shotId: o.shotId })}>
+          <button key={o.label} onClick={() => store.answer(d.id, { label: o.label, shotId: o.shotId, animationId: o.animationId })}>
             {o.shotId && <img src={`/api/library/shots/${o.shotId}/filmstrip`} alt="" />}
+            {o.animationId && <MotionPreview item={{ id: o.animationId, kind: "animation", name: o.label }} autoPlay />}
             <b>{o.label}</b>
+            {o.technique && <small className="t-accent">{o.technique}</small>}
             {(o.detail ?? o.summary) && <small>{o.detail ?? o.summary}</small>}
           </button>
         ))}

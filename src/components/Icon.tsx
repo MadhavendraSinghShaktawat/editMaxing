@@ -1,4 +1,4 @@
-import { BookOpen, Bolt, CircleAlert, Lightbulb, Music, Clapperboard, Coffee, Film, Heart, Moon, PenTool, Scissors, Settings, Sparkles, Star, Sun, Type } from "lucide-react";
+import { BookOpen, Bolt, CircleAlert, Lightbulb, Music, Clapperboard, Coffee, Film, Heart, Moon, PenTool, Scissors, Settings, Sparkles, Star, Sun, Type, WandSparkles } from "lucide-react";
 import { ComponentType } from "react";
 
 const MAP: Record<string, ComponentType<{ size?: number; color?: string; strokeWidth?: number; fill?: string }>> = {
@@ -17,6 +17,7 @@ const MAP: Record<string, ComponentType<{ size?: number; color?: string; strokeW
   sun: Sun,
   moon: Moon,
   sparkles: Sparkles,
+  wand: WandSparkles,
   think: Lightbulb,
   note: Music,
 };

@@ -12,10 +12,22 @@ Every change goes through the Edit Document. Words are the anchor, so a change t
 ## Before you start
 
 1. Call `open_footage` with the main video in `inputs/`. It transcribes on this Mac and saves version 1.
-2. Read the mode, style and memory rules in your instructions. They were decided once. Don't ask about them again.
+2. Read the style and memory rules in your instructions. They were decided once. Don't ask about them again.
 3. If a reference is attached or a style is selected, use the `reference-style` skill first. It covers every area of the style and how to recreate each one.
 
+### Several raw clips
+
+When more than one footage clip is attached, build the story before Stage 1:
+
+1. Call `read_clips` with every footage clip, in the order they were attached. It transcribes each one on this Mac and returns timed lines.
+2. If the user gave a script, follow it line by line: for each line, pick the take that says it best (cleanest delivery, fewest stumbles, usually the last good take). Match by meaning when the words differ a little. Never invent a line, and tell the user which script lines you couldn't find.
+3. Without a script, find the strongest story: a hook in the first lines, one idea per beat, a clear ending. Drop repeats and false starts across clips, not just inside one.
+4. Look at frames with `view_frames` when two takes are close, so you don't pick one that's out of focus or badly framed.
+5. Call `assemble_story` with the takes in order, then `open_footage` with the path it returns. From there, edit it like any single video. Log the story you chose with `log_call`.
+
 Before each stage, call `set_stage`. It moves you around the studio and tells the user where you are.
+
+If `scrapecreators` tools are connected, you can look up public posts, a creator's other videos or transcripts when the user asks or a reference needs context. Every call spends the user's credits, so use them only when they help this edit, and never in a loop.
 
 ## Stage 1: A-cuts (`cutting`)
 
@@ -34,7 +46,7 @@ Use the `broll-director` skill.
 
 ## Stage 3: Captions and animation (`captions`)
 
-Use `edit_ops` with `set_captions`, then `style_words` for the words that matter. Take the reveal, animation, font, size, colour and position from the style. Only use font names from `list_fonts`.
+If the video has a style, start from `get_caption_preset`: it returns a ready `set_captions` op saved from the style's reference. Check its font with `list_fonts` first. Otherwise use `edit_ops` with `set_captions` from the style's captions area. Then use `style_words` for the words that matter. Only use font names from `list_fonts`.
 
 Look at frames from this footage before you settle the position. The style's position came from someone else's framing. If the caption lands on this speaker's face, move it clear of their eyes, nose and mouth, usually below the chin, and keep the rest of the look.
 
@@ -46,11 +58,12 @@ Find the moments where a picture explains better than a face: an explanation, a 
 
 You don't build these. The Motion agent does, while you carry on.
 
-1. For each moment, call `brief_motion_agent` with the words, the job, and `full_screen` or `overlay`. It cuts that section out, packages the reference and reserves those words.
-2. Call the Agent tool once, with `subagent_type` set to `motion`, and give it every brief together. Only one Motion agent can run at a time.
-3. Go straight on with the next stage. Don't wait for it, check on it or schedule a check. If everything else is done, end your turn.
-4. It reports back on its own and wakes you, even if your turn has ended. Check its clip with `view_frames`, then place it with `add_graphic`, using the `reservation` from the brief. Set `hideCaptions` on a full-screen clip, so its words don't appear twice.
-5. If a clip misses, write a new brief saying exactly what's wrong and send that.
+1. For each moment, name the job it needs to do (make a number land, compare two options, walk through steps) and call `suggest_animations`. It returns 3 to 5 saved animations, each a different technique, from the Motion library. Look at the promising ones with `view_animation`. When the pick shapes the video, ask with `ask_choice` and `animationIds`, so the user sees the loops. Otherwise pick yourself and log why. `browse_motion` shows what the library holds.
+2. Call `brief_motion_agent` with the words, the job, `full_screen` or `overlay`, and the chosen animation ids as `examples`. It cuts that section out, packages the reference and the examples, and reserves those words. With nothing saved, brief from the style alone.
+3. Call the Agent tool once, with `subagent_type` set to `motion`, and give it every brief together. Only one Motion agent can run at a time.
+4. Go straight on with the next stage. Don't wait for it, check on it or schedule a check. If everything else is done, end your turn.
+5. It reports back on its own and wakes you, even if your turn has ended. Check its clip with `view_frames`, then place it with `add_graphic`, using the `reservation` from the brief. Set `hideCaptions` on a full-screen clip, so its words don't appear twice.
+6. If a clip misses, write a new brief saying exactly what's wrong and send that.
 
 A final render won't start while a reservation is waiting.
 
@@ -59,6 +72,7 @@ The motion graphics skills belong to the Motion agent. When a clip needs the spe
 ## Stage 5: Sound (`sound`)
 
 1. Use the `sound-effects` skill and the bundled kit, or `epidemic` tools when they're connected.
+   With `envato` tools connected, `search_music` and `search_sound_effects` can suggest tracks. These are links for the user to download and license. Don't add them yourself.
 2. You can't hear. Use the `earshot` tools before you say anything about how audio sounds, and quote the reading.
 3. Add effects with `add_sfx` on a word, and music with `add_music`. Music ducks under speech by default.
 

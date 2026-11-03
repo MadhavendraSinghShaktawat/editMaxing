@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { looksLikeCorrection, similarity, tokens } from "../src/memory.ts";
+import { similarity, tokens } from "../src/memory.ts";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { SHARED_STYLES } from "../src/config.ts";
@@ -21,10 +21,9 @@ test("rules that contradict the measurements are rejected", () => {
   assert.equal(kept[0].rule, "Keep about 9 to 12 cuts per minute");
 });
 
-test("similar corrections match and ordinary requests are ignored", () => {
+test("similar rules match, so the same lesson isn't saved twice", () => {
   assert.ok(similarity(tokens("fewer zooms on faces please"), tokens("too many zooms on faces")) >= 0.5);
-  assert.ok(looksLikeCorrection("fewer zooms please"));
-  assert.ok(!looksLikeCorrection("Great work, thanks"));
+  assert.ok(similarity(tokens("keep captions lower third"), tokens("music should duck under speech")) < 0.2);
 });
 
 const base = { duration: 60, cutsPerMinute: 20, medianShot: 3, brollShare: 0.2, wordsPerMinute: 150 };
@@ -54,7 +53,7 @@ test("a rule can name a nested measurement, either way round", () => {
 });
 
 const area = { summary: "x", rules: [] };
-const shared = () => ({ schema: 1 as const, name: "Quiet Desk", author: "Maddy", mode: null, card: { pacing: area, editing: area, audio: area, captions: area, positioning: area, motion: area, animation: area, effects: area } });
+const shared = () => ({ schema: 1 as const, name: "Quiet Desk", author: "Maddy", card: { pacing: area, editing: area, audio: area, captions: area, positioning: area, motion: area, animation: area, effects: area } });
 
 test("a complete style is ready for the repo", () => {
   assert.deepEqual(checkSharedStyle(shared()), []);
@@ -71,7 +70,7 @@ test("nothing private can reach the repo", () => {
   const leak = shared();
   (leak.card as Record<string, unknown>).structure = "From /Users/maddy/Movies/client.mp4";
   assert.match(checkSharedStyle(leak).join(), /file path/);
-  const exported = toSharedStyle({ name: "A", mode: null, card: { ...shared().card, rejected: [], sourceHash: "abc" } }, "Maddy");
+  const exported = toSharedStyle({ name: "A", card: { ...shared().card, rejected: [], sourceHash: "abc" } }, "Maddy");
   assert.ok(!("rejected" in exported.card) && !("sourceHash" in exported.card));
 });
 

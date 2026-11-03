@@ -43,6 +43,8 @@ test("always allow applies after a person says so", () => {
 
 test("file tools stay inside the mission", () => {
   assert.equal(checkTool("Write", { file_path: "/m/1/work/a.html" }, W, none, []).behavior, "allow");
+  assert.equal(checkTool("mcp__envato__search_stock_video", {}, W, none, []).behavior, "allow");
+  assert.equal(checkTool("mcp__envato__download_item", {}, W, none, []).behavior, "ask");
   assert.equal(checkTool("Write", { file_path: "/etc/x" }, W, none, []).behavior, "ask");
   assert.equal(checkTool("Write", { file_path: "/m/1/inputs/a.mp4" }, W, none, []).behavior, "ask");
   assert.equal(checkTool("Read", { file_path: "/lib/skill.md" }, W, none, ["/lib"]).behavior, "allow");

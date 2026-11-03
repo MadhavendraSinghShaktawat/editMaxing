@@ -1,9 +1,10 @@
-import { Check, Film, ImageIcon, Loader2, Paperclip, X } from "lucide-react";
+import { Check, Film, ImageIcon, Link2, Loader2, Paperclip, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { uploadFile } from "../sim/engine";
+import { StoredFile, api, uploadFile } from "../sim/engine";
 import { Attachment, store } from "../sim/store";
 
-export type Pending = Attachment & { progress: number; error?: string };
+/** `link` marks a video fetched from a pasted address rather than uploaded from this computer. */
+export type Pending = Attachment & { progress: number; error?: string; source?: "link" };
 
 const LIMITS = { image: 10 * 1024 * 1024 };
 
@@ -39,6 +40,16 @@ async function inspectVideo(file: File): Promise<{ thumb?: string; duration?: nu
     URL.revokeObjectURL(url);
   }
 }
+
+/** A pasted address, short enough to read in one row: "instagram.com/reel/DfGTuV5gxPW". */
+const shortLink = (url: string) => {
+  try {
+    const u = new URL(url);
+    return `${u.hostname.replace(/^www\./, "")}${u.pathname.replace(/\/$/, "")}`.slice(0, 60);
+  } catch {
+    return url.slice(0, 60);
+  }
+};
 
 export function useAttachments(defaultRole: Attachment["role"]) {
   const [items, setItems] = useState<Pending[]>([]);
@@ -80,12 +91,54 @@ export function useAttachments(defaultRole: Attachment["role"]) {
     [defaultRole],
   );
 
+  /**
+   * A social video link, downloaded on the Mac through the person's Scrape Creators key. An
+   * unsupported link is refused at once and never added; the caller shows why.
+   */
+  const addLink = useCallback(
+    async (url: string, folders = false): Promise<unknown> => {
+      // A Drive folder becomes one clip per video in it, fetched two at a time.
+      if (folders && /drive\.google\.com\/(?:drive\/(?:u\/\d+\/)?)?folders\//.test(url)) {
+        const { videos } = await api<{ videos: { id: string; name: string; url: string }[] }>("POST", "/api/links/folder", { url });
+        const queued = videos.map((v, i) => ({ ...v, key: `drive-${v.id}-${Date.now()}-${i}` }));
+        setItems((list) => [...list, ...queued.map((v) => ({ id: v.key, name: v.name, kind: "video" as const, role: defaultRole, size: 0, progress: 0.02, source: "link" as const }))]);
+        let next = 0;
+        await Promise.all([0, 1].map(async () => {
+          while (next < queued.length) {
+            const v = queued[next++];
+            setItems((list) => list.map((x) => (x.id === v.key ? { ...x, progress: 0.3 } : x)));
+            try {
+              const r = await api<{ file: StoredFile }>("POST", "/api/links/fetch", { url: v.url });
+              setItems((list) => list.map((x) => (x.id === v.key ? { ...x, name: r.file.name, size: r.file.size, duration: r.file.meta.duration, hash: r.file.hash, progress: 1 } : x)));
+            } catch (e) {
+              setItems((list) => list.map((x) => (x.id === v.key ? { ...x, error: (e as Error).message } : x)));
+            }
+          }
+        }));
+        return { count: videos.length };
+      }
+      const id = `link-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      // The row stays whatever happens, so a refused link keeps its reason on screen instead of vanishing.
+      setItems((v) => [...v, { id, name: shortLink(url), kind: "video", role: defaultRole, size: 0, progress: 0.05, source: "link" }]);
+      try {
+        const r = await api<{ file: StoredFile; platform: string; credits: number }>("POST", "/api/links/fetch", { url });
+        setItems((v) => v.map((x) => (x.id === id ? { ...x, name: r.platform === "Google Drive" ? r.file.name : `${r.platform} video`, size: r.file.size, duration: r.file.meta.duration, hash: r.file.hash, thumb: undefined, progress: 1 } : x)));
+        return r;
+      } catch (e) {
+        setItems((v) => v.map((x) => (x.id === id ? { ...x, error: (e as Error).message } : x)));
+        return null;
+      }
+    },
+    [defaultRole],
+  );
+
   const remove = (id: string) => setItems((v) => v.filter((x) => x.id !== id));
   const setRole = (id: string, role: Attachment["role"]) => setItems((v) => v.map((x) => (x.id === id ? { ...x, role } : x)));
   const clear = () => setItems([]);
-  const busy = items.some((x) => x.progress < 1 || x.error);
-  const ready = (): Attachment[] => items.filter((x) => !x.error).map(({ id, name, kind, role, size, duration, thumb, hash }) => ({ id, name, kind, role, size, duration, thumb, hash }));
-  return { items, add, remove, setRole, clear, busy, ready };
+  // A failed item never blocks: it isn't sent, and it can be removed or left.
+  const busy = items.some((x) => !x.error && x.progress < 1);
+  const ready = (): Attachment[] => items.filter((x) => !x.error && x.progress >= 1).map(({ id, name, kind, role, size, duration, thumb, hash }) => ({ id, name, kind, role, size, duration, thumb, hash }));
+  return { items, add, addLink, remove, setRole, clear, busy, ready };
 }
 
 export function AttachButton({ onFiles, accept }: { onFiles: (f: FileList) => void; accept?: string }) {
@@ -141,6 +194,38 @@ export function AttachmentStrip({ items, onRemove, onRole }: { items: Pending[];
           </button>
         </div>
       ))}
+    </div>
+  );
+}
+
+/**
+ * Paste a TikTok, Instagram, Facebook or other video link instead of a file. Without a Scrape
+ * Creators key it says where to add one; an unsupported link shows the engine's reason.
+ */
+export function LinkInput({ onLink, label = "Or paste a video link" }: { onLink: (url: string) => Promise<unknown>; label?: string }) {
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const submit = async (value = url) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await onLink(value.trim());
+      setUrl("");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="link-input">
+      <form className="ui-inline" onSubmit={(e) => (e.preventDefault(), url.trim() && !busy && void submit())}>
+        <Link2 size={15} className="t-muted" />
+        <input className="ui-input" type="url" value={url} placeholder={label} aria-label={label} disabled={busy} onChange={(e) => { setUrl(e.target.value); setError(null); }} onPaste={(e) => { const t = e.clipboardData.getData("text/plain").trim(); if (/^https?:\/\/\S+$/i.test(t)) { e.preventDefault(); setUrl(t); void submit(t); } }} />
+        <button type="submit" className="ui-btn v-secondary sm" disabled={!url.trim() || busy}>{busy ? <Loader2 size={13} className="ui-spin" /> : null}<span>{busy ? "Fetching" : "Add"}</span></button>
+      </form>
+      {error && <span className="link-error" role="alert">{error}</span>}
     </div>
   );
 }

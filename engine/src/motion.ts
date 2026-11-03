@@ -10,6 +10,7 @@ import { isRemoved, segments, toOutput, wordSpan } from "./editdoc.ts";
 import { run } from "./lib/proc.ts";
 import { findBoundaries, liveliness, readCurve, visualEvents } from "./lib/reference.ts";
 import { probe } from "./lib/media.ts";
+import type { MotionView } from "./motionlib.ts";
 import type { Styles } from "./styles.ts";
 import { STYLE_AREAS } from "./styles.ts";
 
@@ -54,7 +55,9 @@ export type MotionJob = { from: number; to: number; job: string; kind: "full_scr
  * Packages one section for the Motion agent: the cut clip, its words with timing, the output it must
  * make, and the reference. The agent starts cold, so everything it needs lives in this folder.
  */
-export async function writeBrief(chat: ChatRow, docs: Docs, styles: Styles, a: MotionJob) {
+export type Example = { view: MotionView; loop: string | null; strip: string | null };
+
+export async function writeBrief(chat: ChatRow, docs: Docs, styles: Styles, a: MotionJob, examples: Example[] = []) {
   const current = docs.latest(chat.id);
   if (!current) throw new Error("Open the footage first.");
   const { doc } = current;
@@ -95,6 +98,20 @@ export async function writeBrief(chat: ChatRow, docs: Docs, styles: Styles, a: M
     }
   }
 
+  // Saved animations the editor picked travel with the brief, so the agent can study them cold.
+  let exampleNote = "";
+  if (examples.length) {
+    mkdirSync(join(dir, "examples"), { recursive: true });
+    const notes = examples.map((e, i) => {
+      const n = i + 1;
+      if (e.loop && existsSync(e.loop)) copyFileSync(e.loop, join(dir, `examples/${n}.mp4`));
+      if (e.strip && existsSync(e.strip)) copyFileSync(e.strip, join(dir, `examples/${n}.jpg`));
+      writeFileSync(join(dir, `examples/${n}.json`), JSON.stringify({ name: e.view.name, summary: e.view.summary, operation: e.view.operation?.label, technique: e.view.technique?.label, spec: e.view.card.spec }, null, 1));
+      return `${n}. ${e.view.name} (${[e.view.operation?.label, e.view.technique?.label].filter(Boolean).join(" → ")}): ${e.view.summary} See examples/${n}.mp4, examples/${n}.jpg (frames left to right) and examples/${n}.json (the rebuild spec).`;
+    });
+    exampleNote = `\n## Examples to follow\nThe editor picked these saved animations for this section. Rebuild their mechanism with this section's content, timing and words. Don't copy their subject.\n${notes.join("\n")}\n`;
+  }
+
   writeFileSync(join(dir, "words.json"), JSON.stringify(words));
   writeFileSync(join(dir, "brief.md"), `# Motion brief ${id}
 
@@ -113,7 +130,7 @@ ${a.notes ? `\n${a.notes}\n` : ""}
 
 ## The reference
 ${referenceNote}
-`);
+${exampleNote}`);
   docs.apply(chat.id, [{ op: "reserve_graphic", id, from: a.from, to: a.to, label: a.job.slice(0, 60) }], `Waiting on the Motion agent: ${a.job.slice(0, 40)}`);
   return { id, brief: `${rel}/brief.md`, output, seconds, kind: a.kind };
 }

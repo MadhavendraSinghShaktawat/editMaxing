@@ -2,15 +2,15 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, symlinkSync, existsSync } from "node:fs";
 import { basename, delimiter, join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { CanUseTool, McpServerConfig, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { CanUseTool, McpServerConfig, Query, SandboxSettings, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Bus } from "../bus.ts";
-import { DIRS, MOTION_MODULES, MOTION_PYTHON, PLUGIN_DIR } from "../config.ts";
+import { DIRS, HOME, MOTION_MODULES, MOTION_PYTHON, PLUGIN_DIR } from "../config.ts";
 import { MOTION_AGENT } from "../prompt.ts";
 import type { Database } from "../db.ts";
 import { json } from "../db.ts";
 import { AsyncQueue } from "../lib/dsa.ts";
 import type { Accounts } from "./accounts.ts";
-import { checkAgent, checkTool } from "./policy.ts";
+import { checkAgent, checkTool, inside } from "./policy.ts";
 
 export type Station = "library" | "cutting" | "animation" | "captions" | "living" | "sound" | "render" | "review";
 export type ChatStatus = "idle" | "working" | "thinking" | "needs" | "stuck" | "resting";
@@ -18,7 +18,7 @@ export type ChatStatus = "idle" | "working" | "thinking" | "needs" | "stuck" | "
 export type ChatRow = {
   id: string; name: string; look: number; account_id: string; model: string; effort: string | null; session_id: string | null;
   cwd: string; status: ChatStatus; detail: string; station: Station; stage: string | null; mission: string | null; cost: number;
-  created_at: number; updated_at: number; ended_at: number | null;
+  created_at: number; updated_at: number; ended_at: number | null; owner_id: string | null; client_id: string | null;
 };
 
 export const NAMES = [["Kai", 0], ["Noor", 1], ["Sora", 2], ["Aigerim", 3], ["Leo", 4], ["Mei", 5], ["Wayan", 6], ["Dewi", 7]] as const;
@@ -37,6 +37,7 @@ export function stationFor(tool: string, input: Record<string, unknown>): { stat
   }
   if (tool.startsWith("mcp__earshot__")) return { station: "sound", detail: "Listening to the audio" };
   if (tool.startsWith("mcp__epidemic__")) return { station: "sound", detail: "Searching sound effects" };
+  if (tool.startsWith("mcp__envato__")) return /music|sound/.test(tool) ? { station: "sound", detail: "Searching Envato Elements" } : { station: "library", detail: "Searching Envato Elements" };
   if (/search_broll|browse_library|view_filmstrip|find_similar|use_clip/.test(name)) return { station: "library", detail: "Searching B-roll" };
   if (/transcribe|analyze_takes|edit_ops|get_edit/.test(name)) return { station: "cutting", detail: "Cutting A-roll" };
   if (/caption/.test(name)) return { station: "captions", detail: "Timing captions" };
@@ -52,7 +53,7 @@ export function stationFor(tool: string, input: Record<string, unknown>): { stat
 }
 
 /** What a chat is making, chosen once so the editor never has to ask again. */
-export type Brief = { title?: string; modeId?: string | null; styleId?: string | null; reason?: string; locale?: string };
+export type Brief = { title?: string; styleId?: string | null; reason?: string; locale?: string; script?: string };
 
 type Pending = { resolve: (answer: unknown) => void; chatId: string };
 
@@ -61,8 +62,16 @@ type Runtime = { q: Query; input: AsyncQueue<SDKUserMessage>; idle: NodeJS.Timeo
 export type ChatDeps = {
   mcp: (chat: ChatRow) => Promise<Record<string, McpServerConfig>>;
   prompt: (chat: ChatRow) => string;
-  env?: () => Promise<Record<string, string>>;
-  onCorrection?: (chat: ChatRow, text: string) => void;
+  env?: (chat: ChatRow) => Promise<Record<string, string>>;
+  /** Every note a person writes in a chat. Memory reads these, never the footage. */
+  onUserMessage?: (chat: ChatRow, text: string) => void;
+  /** The editor finished a turn and is waiting, which is when memory learns. */
+  onTurnEnd?: (chat: ChatRow) => void;
+  /**
+   * On a Hub, editors run for different people on one Mac. This returns the folders a chat may read
+   * outside its own mission, and the shell sandbox that enforces it. Null means a single-user studio.
+   */
+  isolation?: (chat: ChatRow) => { roots: string[]; sandbox: SandboxSettings } | null;
 };
 
 export class Chats {
@@ -90,36 +99,47 @@ export class Chats {
   }
 
   view(r: ChatRow) {
-    return { id: r.id, name: r.name, look: r.look, accountId: r.account_id, model: r.model, effort: r.effort, status: r.status, detail: r.detail, station: r.station, stage: r.stage, mission: json(r.mission, null), cost: r.cost, createdAt: r.created_at, updatedAt: r.updated_at };
+    return { id: r.id, name: r.name, look: r.look, ownerId: r.owner_id, clientId: r.client_id, accountId: r.account_id, model: r.model, effort: r.effort, status: r.status, detail: r.detail, station: r.station, stage: r.stage, mission: json(r.mission, null), cost: r.cost, createdAt: r.created_at, updatedAt: r.updated_at };
   }
 
-  list() {
-    return this.db.all<ChatRow>("SELECT * FROM chats WHERE ended_at IS NULL ORDER BY created_at").map((r) => this.view(r));
+  /** Open chats for one person. Each person has their own studio, so nobody sees another's editors. */
+  list(ownerId: string) {
+    return this.db.all<ChatRow>("SELECT * FROM chats WHERE ended_at IS NULL AND owner_id = ? ORDER BY created_at", ownerId).map((r) => this.view(r));
+  }
+
+  /** Every chat a person ever had, for admins in Settings → Users. */
+  history(ownerId: string, limit = 200) {
+    return this.db.all<ChatRow>("SELECT * FROM chats WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?", ownerId, limit).map((r) => ({ ...this.view(r), endedAt: r.ended_at }));
   }
 
   messages(id: string) {
     return this.db.all<{ id: number; role: string; kind: string; text: string; data: string | null; created_at: number }>("SELECT * FROM messages WHERE chat_id = ? ORDER BY id", id).map((m) => ({ id: m.id, role: m.role, kind: m.kind, text: m.text, data: json(m.data, null), createdAt: m.created_at }));
   }
 
-  openDecisions(id?: string) {
-    const rows = id ? this.db.all<{ id: string; chat_id: string; kind: string; payload: string }>("SELECT * FROM decisions WHERE status = 'open' AND chat_id = ?", id) : this.db.all<{ id: string; chat_id: string; kind: string; payload: string }>("SELECT * FROM decisions WHERE status = 'open'");
+  openDecisions(where: { chatId: string } | { ownerId: string }) {
+    const rows = "chatId" in where
+      ? this.db.all<{ id: string; chat_id: string; kind: string; payload: string }>("SELECT * FROM decisions WHERE status = 'open' AND chat_id = ?", where.chatId)
+      : this.db.all<{ id: string; chat_id: string; kind: string; payload: string }>("SELECT d.* FROM decisions d JOIN chats c ON c.id = d.chat_id WHERE d.status = 'open' AND c.owner_id = ?", where.ownerId);
     return rows.map((d) => ({ id: d.id, chatId: d.chat_id, kind: d.kind, payload: json(d.payload, {}) }));
   }
 
-  create(options: { accountId?: string; model?: string; effort?: string; brief?: Brief }) {
-    const open = this.db.all<{ name: string }>("SELECT name FROM chats WHERE ended_at IS NULL").map((r) => r.name);
+  create(ownerId: string, options: { accountId?: string; model?: string; effort?: string; brief?: Brief; clientId?: string | null }) {
+    const open = this.db.all<{ name: string }>("SELECT name FROM chats WHERE ended_at IS NULL AND owner_id = ?", ownerId).map((r) => r.name);
     if (open.length >= MAX_CHATS) throw new Error("Your studio is full. End a chat to make room.");
     const [name, look] = NAMES.find(([n]) => !open.includes(n))!;
-    const account = this.accounts.get(options.accountId ?? this.db.setting("account") ?? "default");
+    // Everyone brings their own Claude login. A chat can only run on an account its person owns.
+    const accountId = options.accountId ?? this.db.setting(`m:${ownerId}:account`) ?? this.accounts.firstFor(ownerId);
+    if (!accountId) throw new Error("Add your Claude account first, in the account menu at the top.");
+    const account = this.accounts.owned(ownerId, accountId);
     if (!account.signedIn) throw new Error(`${account.label} isn't signed in yet.`);
     const id = randomUUID();
     const cwd = join(DIRS.missions, id);
     for (const dir of ["inputs", "work", "out", "motion"]) mkdirSync(join(cwd, dir), { recursive: true });
     if (existsSync(MOTION_MODULES)) symlinkSync(MOTION_MODULES, join(cwd, "motion/node_modules"));
     const now = Date.now();
-    const model = options.model ?? this.db.setting("model") ?? "sonnet";
-    const effort = options.effort ?? this.db.setting("effort") ?? "medium";
-    this.db.run("INSERT INTO chats (id, name, look, account_id, model, effort, cwd, mission, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", id, name, look, account.id, model, effort, cwd, JSON.stringify(options.brief ?? {}), now, now);
+    const model = options.model ?? this.db.setting(`m:${ownerId}:model`) ?? "sonnet";
+    const effort = options.effort ?? this.db.setting(`m:${ownerId}:effort`) ?? "medium";
+    this.db.run("INSERT INTO chats (id, name, look, account_id, model, effort, cwd, mission, created_at, updated_at, owner_id, client_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", id, name, look, account.id, model, effort, cwd, JSON.stringify(options.brief ?? {}), now, now, ownerId, options.clientId ?? null);
     const view = this.view(this.row(id));
     this.bus.emit("chat", view);
     return view;
@@ -152,9 +172,10 @@ export class Chats {
   }
 
   setModel(id: string, model: string, effort: string | null) {
+    const owner = this.row(id).owner_id;
     this.db.run("UPDATE chats SET model = ?, effort = ? WHERE id = ?", model, effort, id);
-    this.db.setSetting("model", model);
-    if (effort) this.db.setSetting("effort", effort);
+    this.db.setSetting(`m:${owner}:model`, model);
+    if (effort) this.db.setSetting(`m:${owner}:effort`, effort);
     const rt = this.runtimes.get(id);
     if (rt) {
       void rt.q.setModel(model).catch(() => {});
@@ -167,17 +188,16 @@ export class Chats {
   setAccount(id: string, accountId: string) {
     const r = this.row(id);
     if (r.session_id) throw new Error("This chat already started on another account. Start a new chat to switch.");
-    this.accounts.get(accountId);
+    this.accounts.owned(r.owner_id ?? "", accountId);
     this.db.run("UPDATE chats SET account_id = ? WHERE id = ?", accountId, id);
-    this.db.setSetting("account", accountId);
+    this.db.setSetting(`m:${r.owner_id}:account`, accountId);
     this.bus.emit("chat", this.view(this.row(id)));
   }
 
   async send(id: string, text: string, attachments: { hash: string; name: string; role: string; path: string; kind: string; duration?: number }[] = []) {
     const chat = this.row(id);
     const brief = json<Brief>(chat.mission, {});
-    const replying = this.db.get("SELECT id FROM messages WHERE chat_id = ? AND role = 'user' LIMIT 1", id);
-    if (replying && !text.startsWith("/")) this.deps.onCorrection?.(chat, text);
+    if (text.trim() && !text.startsWith("/")) this.deps.onUserMessage?.(chat, text);
     const lines: string[] = [];
     for (const a of attachments) {
       const safe = basename(a.name).replace(/[^\w.\- ]+/g, "_");
@@ -207,12 +227,13 @@ export class Chats {
     const allowed = new Set<string>();
     const canUseTool: CanUseTool = (name, toolInput, options) => this.permission(id, name, toolInput, options.signal, allowed, options.agentID);
     const account = await this.accounts.options(chat.account_id);
+    const isolation = this.deps.isolation?.(chat) ?? null;
     const q = query({
       prompt: input,
       options: {
         ...account,
         // Renders and first-run model loads take far longer than a normal tool call.
-        env: { ...account.env, ...(await this.deps.env?.()), PATH: `${MOTION_PYTHON}${delimiter}${account.env?.PATH}`, MCP_TIMEOUT: "60000", MCP_TOOL_TIMEOUT: "3600000", DOJO_MOTION_KIT: join(PLUGIN_DIR, "skills/motion-broll"), BASH_DEFAULT_TIMEOUT_MS: "1800000", BASH_MAX_TIMEOUT_MS: "3600000" },
+        env: { ...account.env, ...(await this.deps.env?.(chat)), PATH: `${MOTION_PYTHON}${delimiter}${account.env?.PATH}`, MCP_TIMEOUT: "60000", MCP_TOOL_TIMEOUT: "3600000", DOJO_MOTION_KIT: join(PLUGIN_DIR, "skills/motion-broll"), BASH_DEFAULT_TIMEOUT_MS: "1800000", BASH_MAX_TIMEOUT_MS: "3600000" },
         cwd: chat.cwd,
         model: chat.model,
         effort: (chat.effort ?? undefined) as "medium" | undefined,
@@ -233,6 +254,7 @@ export class Chats {
           },
         },
         canUseTool,
+        ...(isolation ? { sandbox: isolation.sandbox } : {}),
         includePartialMessages: true,
         systemPrompt: { type: "preset", preset: "claude_code", append: this.deps.prompt(chat) },
       },
@@ -307,6 +329,7 @@ export class Chats {
           break;
         }
         this.status(id, { status: m.subtype === "success" ? "idle" : "stuck", detail: m.subtype === "success" ? "" : "Stopped", cost: m.total_cost_usd });
+        if (m.subtype === "success") this.deps.onTurnEnd?.(this.row(id));
         rt.idle = setTimeout(() => this.close(id), IDLE_CLOSE_MS);
         rt.idle.unref();
         this.accounts.noteRateLimit(this.row(id).account_id);
@@ -340,7 +363,12 @@ export class Chats {
       if (!answer) return { behavior: "deny" as const, message: "No answer was given." };
       return { behavior: "allow" as const, updatedInput: { questions: input.questions, answers: answer.answers ?? {}, ...(answer.response ? { response: answer.response } : {}) } };
     }
-    const verdict = checkTool(name, input, chat.cwd, allowed, [PLUGIN_DIR, DIRS.library, DIRS.files, DIRS.cache]);
+    const isolation = this.deps.isolation?.(chat) ?? null;
+    const roots = isolation?.roots ?? [PLUGIN_DIR, DIRS.library, DIRS.files, DIRS.cache];
+    const verdict = checkTool(name, input, chat.cwd, allowed, roots);
+    // On a Hub, other people's footage and the studio's own data are never one click away.
+    const target = String(input.file_path ?? input.notebook_path ?? input.path ?? "");
+    if (isolation && verdict.behavior === "ask" && name !== "Bash" && target && inside(target, HOME)) return { behavior: "deny" as const, message: "That file belongs to the studio or to someone else. Use files from this mission." };
     if (verdict.behavior === "allow") return { behavior: "allow" as const, updatedInput: input };
     if (verdict.behavior === "deny") return { behavior: "deny" as const, message: verdict.reason };
     const answer = (await this.ask(id, "permission", { tool: name, input, reason: verdict.reason }, signal)) as { allow?: boolean; always?: boolean } | null;
@@ -407,6 +435,15 @@ export class Chats {
     for (const id of [...this.runtimes.keys()]) this.close(id);
   }
 
+  /** When someone leaves the studio, their editors stop at once. Their chats stay for admins to see. */
+  closeOwner(ownerId: string) {
+    for (const r of this.db.all<{ id: string }>("SELECT id FROM chats WHERE owner_id = ? AND ended_at IS NULL", ownerId)) {
+      for (const [decision, p] of this.pending) if (p.chatId === r.id) p.resolve(null), this.pending.delete(decision);
+      this.close(r.id);
+      this.db.run("UPDATE chats SET status = 'idle', detail = '' WHERE id = ?", r.id);
+    }
+  }
+
   get busy() {
     return this.db.get<{ n: number }>("SELECT COUNT(*) n FROM chats WHERE ended_at IS NULL AND status IN ('working', 'thinking')")!.n;
   }
@@ -427,6 +464,7 @@ export function toolLabel(tool: string, input: Record<string, unknown>) {
   if (named) return named;
   if (tool.startsWith("mcp__earshot__")) return "Listening to the audio";
   if (tool.startsWith("mcp__epidemic__")) return "Searching Epidemic Sound";
+  if (tool.startsWith("mcp__envato__")) return "Searching Envato Elements";
   const short = tool.replace(/^mcp__/, "").replace(/__/g, " ");
   if (tool === "Agent" || tool === "Task") return "Briefing the Motion agent";
   if (tool === "Bash") return String(input.description ?? "Running a command").slice(0, 80);

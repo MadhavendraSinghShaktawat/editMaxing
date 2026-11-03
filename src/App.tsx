@@ -36,8 +36,13 @@ export default function App() {
       <ChatPanel onReview={setReview} onVideo={() => setMission(true)} />
       <Dock onBoard={setBoard} onVideo={() => setMission(true)} />
       <Toast />
+      {s.studio.closingAt && (
+        <div className="hub-banner" role="status">
+          Hub closes {new Date(s.studio.closingAt).toLocaleDateString(undefined, { day: "numeric", month: "long" })}. Export your work in Settings.
+        </div>
+      )}
       {mission && <NewMission onClose={closeMission} />}
-      {board && <Board id={board} onClose={closeBoard} />}
+      {board && <Board id={board} onClose={closeBoard} onBoard={setBoard} />}
       {review && <Review id={review} onClose={closeReview} />}
       {accounts && <Accounts onClose={closeAccounts} />}
     </main>

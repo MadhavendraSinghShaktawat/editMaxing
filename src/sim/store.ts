@@ -3,7 +3,7 @@ import { DOCK, Facing, STATIONS, Spot, StationId } from "../world/layout";
 import { findPath } from "../world/nav";
 import { Pose } from "../world3d/types";
 import { BROLL_PROMPTS, CHAT_NAMES, CREW_SEED, Mission, QUEUED_MISSIONS, STAGES, StageId, Thumb } from "./data";
-import { Account, Brief, ChatStatus, ChatView, EngineDecision, EngineMessage, EngineStyle, EventType, Job, LibraryStats, MemoryRule, Pack, Recipe, State, api, connect, leftOf } from "./engine";
+import { Account, Brief, ChatStatus, ChatView, Client, Colleague, EngineDecision, EngineMessage, EngineStyle, EventType, Job, MotionItem, LibraryStats, LibraryView, Me, MemoryRule, Pack, Recipe, State, Studio, api, connect, leftOf } from "./engine";
 
 export type Activity = "working" | "walking" | "thinking" | "needs" | "coffee" | "chatting" | "celebrating" | "resting" | "stuck" | "waiting";
 
@@ -24,6 +24,8 @@ export type Message = {
   attachments?: Attachment[];
   video?: { url: string; quality?: { pass: boolean; checks: { name: string; ok: boolean; detail: string }[] } | null; srt?: string | null; fcpxml?: string | null };
   error?: boolean;
+  /** A lesson memory wants to keep, waiting for one tap. */
+  memory?: { ruleId: string; clientId: string | null };
 };
 
 export type Attachment = {
@@ -120,15 +122,25 @@ class Store {
   live = !new URLSearchParams(location.search).has("demo");
   online = false;
   accounts: Account[] = [];
-  modes: State["modes"] = [];
+  motion: MotionItem[] = [];
+  /** Bumped when the Motion library or its taxonomy changes, so open boards reload. */
+  motionVersion = 0;
   styles: EngineStyle[] = [];
   recipes: Recipe[] = [];
   memory: MemoryRule[] = [];
+  memoryAreas: string[] = [];
+  me: Me | null = null;
+  studio: Studio = { mode: "single", hubOrigin: null, joinedHub: null, closingAt: null };
+  members: Colleague[] = [];
+  clients: Client[] = [];
+  libraries: LibraryView[] = [];
+  /** Bumps when something on the Team side changes, so open admin screens reload. */
+  teamVersion = 0;
   packs: Pack[] = [];
   keys: Record<string, boolean> = {};
   library: LibraryStats | null = null;
   jobs = new Map<string, Job>();
-  settings: State["settings"] = { account: "default", model: "sonnet", effort: "medium", embedModel: "" };
+  settings: State["settings"] = { account: "default", model: "sonnet", effort: "medium", embedModel: "", usageCeiling: 85 };
   login: { id: string; status: string; url?: string; label?: string } | null = null;
   pendingDraft: string | null = null;
   private names = [...CHAT_NAMES];
@@ -151,16 +163,29 @@ class Store {
     });
   }
 
+  /** Reloads the Motion library and styles, whose thumbnails come from it. */
+  async refreshMotion() {
+    await this.refresh();
+    this.motionVersion++;
+    this.emit();
+  }
+
   /** Runs on every connect, so a reconnect also heals anything missed while offline. */
   async refresh() {
     try {
       const s = await api<State>("GET", "/api/state");
       this.online = true;
       this.accounts = s.accounts;
-      this.modes = s.modes;
+      this.motion = s.motion ?? [];
       this.styles = s.styles;
       this.recipes = s.recipes;
       this.memory = s.memory;
+      this.memoryAreas = s.memoryAreas;
+      this.me = s.me;
+      this.studio = s.studio;
+      this.members = s.members;
+      this.clients = s.clients;
+      this.libraries = s.libraries;
       this.packs = s.packs;
       this.keys = s.keys;
       this.library = s.library;
@@ -202,9 +227,8 @@ class Store {
   private missionOf(c: ChatView): Mission | null {
     const brief = (c.mission ?? {}) as Brief;
     if (!brief.title) return null;
-    const mode = this.modes.find((m) => m.id === brief.modeId)?.label ?? "Custom";
     const style = this.styles.find((v) => v.id === brief.styleId)?.name ?? "Default";
-    return { title: brief.title, mode, style, length: "--:--" };
+    return { title: brief.title, style, length: "--:--" };
   }
 
   private syncChat(c: ChatView) {
@@ -248,6 +272,7 @@ class Store {
     const from = m.role === "user" ? "user" : m.role === "system" ? "system" : "editor";
     const out: Message = { id: m.id, from, text: m.text };
     if (m.kind === "tool") out.tool = m.text;
+    if (m.kind === "memory.suggest" && typeof d.ruleId === "string") out.memory = { ruleId: d.ruleId, clientId: (d.clientId as string | null) ?? null };
     if (m.kind === "error") out.error = true;
     if (m.kind === "video") {
       const name = String(d.path ?? "").split("/").pop() ?? "";
@@ -327,7 +352,13 @@ class Store {
         break;
       }
       case "library":
-        this.library = data as LibraryStats;
+        // Counts depend on who's asking, so the event only says something changed.
+        void this.attempt(async () => {
+          const r = await api<{ stats: LibraryStats; libraries: LibraryView[] }>("GET", "/api/library");
+          this.library = r.stats;
+          this.libraries = r.libraries;
+          this.emit();
+        });
         break;
       case "library.warning":
         this.notify((data as { message: string }).message);
@@ -340,11 +371,35 @@ class Store {
       case "style.removed":
         this.styles = this.styles.filter((o) => o.id !== (data as { id: string }).id);
         break;
+      case "motion": {
+        // A whole harvest only says which style it came from, so the list is fetched again.
+        const v = data as MotionItem | { styleId: string };
+        if ("kind" in v) this.motion = [v, ...this.motion.filter((o) => o.id !== v.id)];
+        else void this.refreshMotion();
+        this.motionVersion++;
+        break;
+      }
+      case "motion.removed":
+        this.motion = this.motion.filter((o) => o.id !== (data as { id: string }).id);
+        this.motionVersion++;
+        break;
+      case "motion.taxonomy":
+        this.motionVersion++;
+        break;
       case "recipe":
         this.recipes = [...this.recipes, data as Recipe];
         break;
-      case "memory":
-        this.memory = [data as MemoryRule, ...this.memory];
+      case "memory": {
+        const rule = data as MemoryRule;
+        this.memory = rule.status === "removed" || rule.status === "superseded" ? this.memory.filter((m) => m.id !== rule.id) : [rule, ...this.memory.filter((m) => m.id !== rule.id)];
+        break;
+      }
+      case "memory.removed":
+        this.memory = this.memory.filter((m) => m.id !== (data as { id: string }).id);
+        break;
+      case "team":
+        this.teamVersion++;
+        void this.refresh();
         break;
       case "limit":
         this.notify("An editor is waiting for the usage limit to reset.");
@@ -460,7 +515,7 @@ class Store {
 
   private seedChat(e: Editor) {
     if (!e.mission) return;
-    e.messages.push({ id: uid(), from: "system", text: `${e.mission.title} · ${e.mission.mode} · ${e.mission.style}` });
+    e.messages.push({ id: uid(), from: "system", text: `${e.mission.title} · ${e.mission.style}` });
     e.messages.push({ id: uid(), from: "user", text: `Use my ${e.mission.style} style. Keep it honest and let the pauses breathe.` });
     e.messages.push({
       id: uid(),
@@ -502,7 +557,7 @@ class Store {
     return e;
   }
 
-  async createChat(options: { accountId?: string; model?: string; effort?: string; brief?: Brief } = {}) {
+  async createChat(options: { accountId?: string; model?: string; effort?: string; brief?: Brief; clientId?: string | null } = {}) {
     const view = await this.attempt(() => api<ChatView>("POST", "/api/chats", { model: this.lastModel.model, effort: this.lastModel.effort, ...options }));
     if (!view) return null;
     this.syncChat(view);
@@ -641,7 +696,7 @@ class Store {
     const reference = attachments.some((a) => a.role === "reference");
     if (!e.mission && (footage || (text.trim() && !reference))) {
       const title = text.trim() ? text.trim().slice(0, 44) : footage!.name.replace(/\.[^.]+$/, "");
-      e.mission = { title, mode: "Custom", style: "Default", length: "--:--" };
+      e.mission = { title, style: "Default", length: "--:--" };
       e.stage = 0;
       e.overall = 0;
       e.messages.push({ id: uid(), from: "editor", text: "On it. Autopilot is on, so I'll only stop you if something can't be undone." });
@@ -672,7 +727,7 @@ class Store {
   }
 
   /** Creates the chat with its brief, so the editor never needs to ask about mode or style. */
-  async startVideo(brief: Brief, text: string, files: Attachment[], options: { accountId?: string; model: string; effort: string }) {
+  async startVideo(brief: Brief, text: string, files: Attachment[], options: { accountId?: string; model: string; effort: string; clientId?: string | null }) {
     const view = await this.createChat({ ...options, brief });
     if (view) this.send(view.id, text, files);
   }
@@ -694,7 +749,7 @@ class Store {
     e.stageProgress = 0;
     e.overall = 0;
     e.version = 1;
-    e.messages.push({ id: uid(), from: "system", text: `${mission.title} · ${mission.mode} · ${mission.style}` });
+    e.messages.push({ id: uid(), from: "system", text: `${mission.title} · ${mission.style}` });
     if (why || reference) e.messages.push({ id: uid(), from: "user", text: why, attachments: reference ? [reference] : [] });
     e.messages.push({ id: uid(), from: "editor", text: "On it. Autopilot is on, so I'll only stop you if something can't be undone." });
     this.beginStage(e);

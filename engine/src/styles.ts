@@ -15,15 +15,10 @@ import { run } from "./lib/proc.ts";
 import type { CutFit, Earshot, FrameRead, Moment, Sample } from "./lib/reference.ts";
 import { chooseMoments, findBoundaries, liveliness, readCurve, shotsFrom, solidCards, summarizeAudio, summarizeCamera, summarizeFaces, summarizeText, visualEvents } from "./lib/reference.ts";
 import type { Tools } from "./tools.ts";
-
-export const EDIT_MODES = [
-  { id: "youtube-explainer", label: "YouTube Explainer", rules: "Hook in 5 seconds. Change the picture every 4 to 7 seconds. Use graphics for anything numeric or abstract. Keep pauses after strong claims." },
-  { id: "youtube-tutorial", label: "YouTube Tutorial", rules: "Show each step on screen. Zoom on every click. Add chapter cards. Remove all retakes. Never hide what the viewer needs to copy." },
-  { id: "youtube-vlog", label: "YouTube Vlog", rules: "Let scenes breathe. Long B-roll, ambient sound, and light captions. Keep real moments and reactions." },
-  { id: "youtube-review", label: "YouTube Review", rules: "Lead with the verdict. Cut to product detail on every claim. Use comparison graphics. Keep sound clean." },
-  { id: "instagram-reel", label: "Instagram Reel", rules: "Vertical. Strong claim in the first second. Change the picture every 1 to 2 seconds. Large captions always on. A sound on every beat." },
-  { id: "instagram-explainer", label: "Instagram Explainer", rules: "Vertical. One idea only. Under 60 seconds. Big captions, fast graphics, a clear ending line." },
-];
+import { HttpError } from "./lib/http.ts";
+import type { Access, Grant } from "./team/access.ts";
+import type { Viewer } from "./team/team.ts";
+import type { MotionLibrary } from "./motionlib.ts";
 
 /** Older installs started with these. Nothing ships pre-made now, so unedited copies are cleared on start. */
 const RETIRED_STYLES = [["Founder Calm", "Slow cuts, generous pauses, warm captions."], ["Hype Kinetic", "Fast cuts, big type, a sound on every beat."], ["Clean Studio", "Tidy zooms, screen focus, clear steps."], ["Golden Hour", "Filmic colour, ambient sound, long B-roll."]];
@@ -31,7 +26,7 @@ const RETIRED_RECIPES = [["Founder story cut", "Keep the pauses after hard truth
 
 const SHARED = "shared:";
 
-export type SharedStyle = { schema: 1; name: string; author: string; mode: string | null; card: Record<string, unknown> };
+export type SharedStyle = { schema: 1; name: string; author: string; card: Record<string, unknown> };
 
 export const slugOf = (name: string) => name.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 
@@ -41,7 +36,6 @@ export function checkSharedStyle(v: Partial<SharedStyle>) {
   if (v.schema !== 1) problems.push("schema must be 1.");
   if (!v.name?.trim()) problems.push("Give the style a name.");
   if (!v.author?.trim()) problems.push("Add an author, so the style has a sensei.");
-  if (v.mode !== null && v.mode !== undefined && !EDIT_MODES.some((m) => m.id === v.mode)) problems.push(`mode must be one of: ${EDIT_MODES.map((m) => m.id).join(", ")}, or null.`);
   const card = v.card as Record<string, { summary?: string; rules?: Rule[] }> | undefined;
   if (!card) return [...problems, "The style has no card."];
   for (const area of STYLE_AREAS) {
@@ -56,9 +50,9 @@ export function checkSharedStyle(v: Partial<SharedStyle>) {
 }
 
 /** Strips what stays private before a style leaves someone's Mac. */
-export function toSharedStyle(style: { name: string; mode: string | null; card: Record<string, unknown> }, author: string): SharedStyle {
+export function toSharedStyle(style: { name: string; card: Record<string, unknown> }, author: string): SharedStyle {
   const { rejected: _rejected, sourceHash: _source, ...card } = style.card;
-  return { schema: 1, name: style.name, author, mode: style.mode, card };
+  return { schema: 1, name: style.name, author, card };
 }
 
 export const STYLE_AREAS = [
@@ -178,6 +172,18 @@ export function verifyRules(card: { rules: Rule[] }, m: { duration: number; cuts
   return { kept, rejected };
 }
 
+/** A style as people see it. "repo" styles ship with the app; the rest belong to someone. */
+export type StyleView = {
+  id: string; name: string; status: string; card: Record<string, unknown>; sourceHash: string | null;
+  shared: boolean; author: string | null; ownerId: string | null; access: "own" | "use" | "edit" | "repo"; sharedWith: { grantee: string; permission: string }[];
+  /** Address of this style's thumbnail image, or null when it has none. */
+  thumbnail: string | null;
+};
+
+type StyleRow = { id: string; name: string; status: string; card: string; source_hash: string | null; owner_id: string | null };
+
+export const isRepoStyle = (id: string) => id.startsWith(SHARED);
+
 export class Styles {
   private db: Database;
   private bus: Bus;
@@ -185,7 +191,7 @@ export class Styles {
   private jobs: Jobs;
   private tools: Tools;
   private accounts: Accounts;
-  private shared: { id: string; name: string; status: string; mode: string | null; card: Record<string, unknown>; sourceHash: null; shared: true; author: string }[] = [];
+  private shared: StyleView[] = [];
 
   constructor(db: Database, bus: Bus, files: Files, jobs: Jobs, tools: Tools, accounts: Accounts) {
     this.db = db;
@@ -197,7 +203,37 @@ export class Styles {
     for (const [name, summary] of RETIRED_STYLES) db.run("DELETE FROM styles WHERE name = ? AND source_hash IS NULL AND json_extract(card, '$.summary') = ?", name, summary);
     for (const [title, text] of RETIRED_RECIPES) db.run("DELETE FROM recipes WHERE title = ? AND text = ?", title, text);
     this.shared = this.loadShared();
-    jobs.register<{ hash: string; accountId: string; mode: string | null; locale: string }>("style.analyze", (p, ctx) => this.analyze(p, ctx));
+    jobs.register<{ hash: string; accountId: string; locale: string }>("style.analyze", (p, ctx) => this.analyze(p, ctx));
+  }
+
+  /** Set at startup, so sharing rules live in one place. */
+  access: Access | null = null;
+  /** Set at startup. Learning a style also saves its animations, caption preset and thumbnail there. */
+  motion: MotionLibrary | null = null;
+
+  private toView(s: StyleRow, viewerId: string | null): StyleView {
+    const sharedWith = this.access?.grants("style", s.id) ?? [];
+    const granted = viewerId && s.owner_id !== viewerId ? this.access?.granted("style", s.id, viewerId) : null;
+    const thumbnail = this.thumbnailPath(s.id) ? `/api/styles/${encodeURIComponent(s.id)}/thumbnail` : null;
+    return { id: s.id, name: s.name, status: s.status, card: json<Record<string, unknown>>(s.card, {}), sourceHash: s.source_hash, shared: sharedWith.length > 0, author: null, ownerId: s.owner_id, access: s.owner_id === viewerId ? "own" : granted === "edit" ? "edit" : "use", sharedWith, thumbnail };
+  }
+
+  /**
+   * The frame that stands for a style: the one Claude picked for the Motion library, or the
+   * frame saved while learning, so every style learned here has one even if that step failed.
+   */
+  thumbnailPath(id: string) {
+    if (isRepoStyle(id)) return null;
+    const picked = this.motion?.thumbnails([id]).get(id);
+    if (picked) {
+      try {
+        return this.motion!.posterPath(picked);
+      } catch {
+        // Removed from the Motion library. The saved frame still stands in.
+      }
+    }
+    const saved = join(DIRS.styles, id, "thumbnail.jpg");
+    return existsSync(saved) ? saved : null;
   }
 
   /** Styles in the repo. A broken file is skipped with a note, so it can't stop the app from starting. */
@@ -212,38 +248,82 @@ export class Styles {
         console.warn(`Skipping shared style ${slug}: ${problems[0]}`);
         return [];
       }
-      return [{ id: `${SHARED}${slug}`, name: style.name!, status: "approved", mode: style.mode ?? null, card: style.card!, sourceHash: null, shared: true as const, author: style.author! }];
+      return [{ id: `${SHARED}${slug}`, name: style.name!, status: "approved", card: style.card!, sourceHash: null, shared: true, author: style.author!, ownerId: null, access: "repo" as const, sharedWith: [], thumbnail: null }];
     });
   }
 
-  list() {
-    const own = this.db.all<{ id: string; name: string; status: string; mode: string | null; card: string; source_hash: string | null }>("SELECT * FROM styles ORDER BY created_at").map((s) => ({ id: s.id, name: s.name, status: s.status, mode: s.mode, card: json<Record<string, unknown>>(s.card, {}), sourceHash: s.source_hash, shared: false, author: null as string | null }));
-    return [...own, ...this.shared];
+  /** Styles this person can use: their own, ones shared with them or the team, and the repo's. */
+  list(viewerId: string) {
+    const ids = new Set(this.access?.visible("style", { id: viewerId, name: "", role: "editor", via: "session" }) ?? []);
+    const rows = this.db.all<StyleRow>("SELECT * FROM styles ORDER BY created_at").filter((s) => ids.has(s.id));
+    return [...rows.map((s) => this.toView(s, viewerId)), ...this.shared];
   }
 
+  /** One member's own styles, for admins in Settings → Users. */
+  ownedBy(memberId: string) {
+    return this.db.all<StyleRow>("SELECT * FROM styles WHERE owner_id = ? ORDER BY created_at", memberId).map((s) => this.toView(s, memberId));
+  }
+
+  /** Reads any style by id. Callers check access first; editors only ever get ids from their own brief. */
   get(id: string) {
-    const s = this.list().find((v) => v.id === id);
-    if (!s) throw new Error("That style no longer exists.");
-    return s;
+    if (isRepoStyle(id)) {
+      const s = this.shared.find((v) => v.id === id);
+      if (!s) throw new HttpError(404, "That style no longer exists.");
+      return s;
+    }
+    const s = this.db.get<StyleRow>("SELECT * FROM styles WHERE id = ?", id);
+    if (!s) throw new HttpError(404, "That style no longer exists.");
+    return this.toView(s, s.owner_id);
   }
 
-  /** A draft goes live only when a person approves it. */
-  update(id: string, patch: { name?: string; status?: string; card?: unknown }) {
-    if (id.startsWith(SHARED)) throw new Error("Shared styles live in the repo, so they can't be changed here.");
+  canUse(viewerId: string, id: string) {
+    if (isRepoStyle(id)) return this.shared.some((s) => s.id === id);
+    return this.access?.can({ id: viewerId, name: "", role: "editor", via: "session" }, "style", id, "use") ?? false;
+  }
+
+  private audience(id: string) {
+    return this.access?.audience("style", id) ?? "admins";
+  }
+
+  /** A draft goes live only when a person approves it. Its owner, or someone it was shared with to edit, can change it. */
+  update(viewer: Viewer, id: string, patch: { name?: string; status?: string; card?: unknown }) {
+    if (isRepoStyle(id)) throw new HttpError(400, "Shared styles live in the repo, so they can't be changed here.");
+    this.access!.require(viewer, "style", id, "edit");
     const s = this.get(id);
-    this.db.run("UPDATE styles SET name = ?, status = ?, card = ?, updated_at = ? WHERE id = ?", patch.name ?? s.name, patch.status ?? s.status, JSON.stringify(patch.card ?? s.card), Date.now(), id);
-    this.bus.emit("style", this.get(id));
+    if (patch.status && !["draft", "approved"].includes(patch.status)) throw new HttpError(400, "A style is a draft or approved.");
+    this.db.run("UPDATE styles SET name = ?, status = ?, card = ?, updated_at = ? WHERE id = ?", patch.name?.trim() || s.name, patch.status ?? s.status, JSON.stringify(patch.card ?? s.card), Date.now(), id);
+    if (s.ownerId !== viewer.id) this.access!.audit(viewer, "style.update", id, s.ownerId);
+    this.bus.emit("style", this.get(id), this.audience(id));
     return this.get(id);
   }
 
-  remove(id: string) {
-    if (id.startsWith(SHARED)) throw new Error("Shared styles live in the repo, so they can't be deleted here.");
-    this.db.run("DELETE FROM styles WHERE id = ?", id);
-    this.bus.emit("style.removed", { id });
+  remove(viewer: Viewer, id: string, asAdmin = false) {
+    if (isRepoStyle(id)) throw new HttpError(400, "Shared styles live in the repo, so they can't be deleted here.");
+    const s = this.get(id);
+    if (!(asAdmin && (viewer.role === "owner" || viewer.role === "admin"))) this.access!.require(viewer, "style", id, "own");
+    const audience = this.audience(id);
+    this.db.tx(() => {
+      this.db.run("DELETE FROM shares WHERE resource_type = 'style' AND resource_id = ?", id);
+      this.db.run("DELETE FROM styles WHERE id = ?", id);
+    });
+    if (asAdmin) this.access!.audit(viewer, "style.remove", id, s.ownerId, { name: s.name });
+    this.bus.emit("style.removed", { id }, audience);
   }
 
-  learn(hash: string, accountId: string, mode: string | null, locale = "en-US") {
-    return this.jobs.add("style.analyze", { hash, accountId, mode, locale }, { lane: "claude", priority: 2 });
+  share(viewer: Viewer, id: string, grants: Grant[]) {
+    if (isRepoStyle(id)) throw new HttpError(400, "Repo styles are already shared with everyone.");
+    const before = this.audience(id);
+    this.access!.setGrants(viewer, "style", id, grants);
+    const after = this.audience(id);
+    // People who just lost access drop it; people who gained it see it appear.
+    const gone = Array.isArray(before) ? before.filter((m) => after !== "*" && !after.includes(m)) : [];
+    if (gone.length) this.bus.emit("style.removed", { id }, gone);
+    this.bus.emit("style", this.get(id), after);
+    return this.get(id);
+  }
+
+  learn(viewer: Viewer, hash: string, accountId: string, locale = "en-US") {
+    return this.jobs.add("style.analyze", { hash, accountId, locale }, { lane: "claude", priority: 2, owner: viewer.id });
   }
 
   /** Local evidence. Tools measure; Claude judges. */
@@ -387,7 +467,8 @@ export class Styles {
   }
 
   /** Reference analysis is Claude's alone: one read for structure, one for movement, one for type, then the card. */
-  private async analyze(p: { hash: string; accountId: string; mode: string | null; locale: string }, ctx: JobContext) {
+  private async analyze(p: { hash: string; accountId: string; locale: string }, ctx: JobContext) {
+    if (!ctx.owner) throw new Error("This style job has no owner. Start it again.");
     const dir = join(DIRS.tmp, randomUUID());
     mkdirSync(dir, { recursive: true });
     try {
@@ -440,12 +521,30 @@ export class Styles {
       // The Motion agent studies the same sequences, so they outlive this job.
       const keep = join(DIRS.styles, id);
       mkdirSync(keep, { recursive: true });
+      // A thumbnail from the start, so the style shows with a picture whatever happens next.
+      const cover = m.picks.find((t) => t >= Math.min(1, m.duration / 3)) ?? m.picks[0] ?? m.duration / 2;
+      await frameAt(m.path, cover, join(keep, "thumbnail.jpg"), 720).catch(() => {});
       for (const f of readdirSync(dir)) if (/^(overview|motion-\d+|type-\d+)\.jpg$/.test(f)) cpSync(join(dir, f), join(keep, f));
       writeFileSync(join(keep, "moments.json"), JSON.stringify({ motion: motionSheets.map((s) => s.rows), type: typeSheets.map((s) => s.rows) }));
 
-      this.db.run("INSERT INTO styles (id, name, status, mode, card, source_hash, created_at, updated_at) VALUES (?, ?, 'draft', ?, ?, ?, ?, ?)", id, card.name, p.mode, JSON.stringify(stored), p.hash, now, now);
-      this.bus.emit("style", this.get(id));
-      return { styleId: id, rules: kept.length, rejected: rejected.length };
+      this.db.run("INSERT INTO styles (id, name, status, card, source_hash, created_at, updated_at, owner_id) VALUES (?, ?, 'draft', ?, ?, ?, ?, ?)", id, card.name, JSON.stringify(stored), p.hash, now, now, ctx.owner);
+
+      // The same sequences feed the Motion library. A failure here keeps the style and says why.
+      let saved: { animations: number; rejected: { name: string; reason: string }[] } | null = null;
+      if (this.motion) {
+        try {
+          const notes = JSON.stringify({ motion: movement.value, type: typing.value, animation: card.animation?.summary, effects: card.effects?.summary, captions: card.captions?.summary });
+          saved = await this.motion.harvest({
+            styleId: id, styleName: card.name, owner: ctx.owner, accountId: p.accountId, sourceHash: p.hash, path: m.path, duration: m.duration,
+            sequences: [...motionSheets, ...typeSheets], stills: m.picks, notes, captions: card.captions as Record<string, unknown> | undefined, signal: ctx.signal, progress: ctx.progress,
+          });
+        } catch (e) {
+          if (ctx.signal.aborted) throw e;
+          this.bus.emit("library.warning", { message: `The style was saved, but its animations weren't: ${(e as Error).message}` }, [ctx.owner]);
+        }
+      }
+      this.bus.emit("style", this.get(id), [ctx.owner]);
+      return { styleId: id, rules: kept.length, rejected: rejected.length, animations: saved?.animations ?? 0 };
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -458,30 +557,37 @@ export class Styles {
     mkdirSync(into, { recursive: true });
     const files = existsSync(from) ? readdirSync(from) : [];
     for (const f of files) cpSync(join(from, f), join(into, f));
-    return { style, files: files.filter((f) => f.endsWith(".jpg")), source: style.sourceHash ? this.files.get(style.sourceHash).path : null };
+    return { style, files: files.filter((f) => f.endsWith(".jpg") && f !== "thumbnail.jpg"), source: style.sourceHash ? this.files.get(style.sourceHash).path : null };
   }
 
   factsFor(m: Measures) {
     return JSON.stringify({ duration: m.duration, vertical: m.vertical, shots: m.shots, cutsPerMinute: Number(m.cutsPerMinute.toFixed(1)), joinsByThirdOfVideo: m.cutsByThird, medianShotSeconds: Number(m.medianShot.toFixed(2)), shortestShot: Number(m.shortestShot.toFixed(2)), longestShot: Number(m.longestShot.toFixed(2)), joins: m.joins, transitions: m.transitions, solidCards: m.solidCards, shareOfFramesWithoutFace: Number(m.brollShare.toFixed(2)), camera: m.camera, pace: m.pace, captions: m.type, framing: m.faces, wordsPerMinute: Math.round(m.wordsPerMinute), pauses: m.pauses, longestPauseSeconds: Number(m.longestPause.toFixed(2)), loudness: m.loudness, palette: m.palette, sound: m.sound });
   }
 
-  recipes() {
-    return this.db.all<{ id: string; title: string; text: string; uses: number }>("SELECT id, title, text, uses FROM recipes ORDER BY uses DESC, created_at");
+  /** Prompt recipes are private to the person who wrote them. */
+  recipes(ownerId: string) {
+    return this.db.all<{ id: string; title: string; text: string; uses: number }>("SELECT id, title, text, uses FROM recipes WHERE owner_id = ? ORDER BY uses DESC, created_at", ownerId);
   }
 
-  addRecipe(title: string, text: string) {
+  addRecipe(ownerId: string, title: string, text: string) {
+    const t = title?.trim().slice(0, 120);
+    const body = text?.trim().slice(0, 8000);
+    if (!t || !body) throw new HttpError(400, "A recipe needs a title and some text.");
     const id = randomUUID();
-    this.db.run("INSERT INTO recipes (id, title, text, created_at) VALUES (?, ?, ?, ?)", id, title, text, Date.now());
-    this.bus.emit("recipe", { id, title, text, uses: 0 });
+    this.db.run("INSERT INTO recipes (id, title, text, created_at, owner_id) VALUES (?, ?, ?, ?, ?)", id, t, body, Date.now(), ownerId);
+    this.bus.emit("recipe", { id, title: t, text: body, uses: 0 }, [ownerId]);
     return id;
   }
 
-  useRecipe(id: string) {
-    this.db.run("UPDATE recipes SET uses = uses + 1 WHERE id = ?", id);
+  useRecipe(ownerId: string, id: string) {
+    this.db.run("UPDATE recipes SET uses = uses + 1 WHERE id = ? AND owner_id = ?", id, ownerId);
   }
 
-  removeRecipe(id: string) {
+  removeRecipe(viewer: Viewer, id: string, asAdmin = false) {
+    const r = this.db.get<{ owner_id: string | null; title: string }>("SELECT owner_id, title FROM recipes WHERE id = ?", id);
+    if (!r || (r.owner_id !== viewer.id && !(asAdmin && (viewer.role === "owner" || viewer.role === "admin")))) throw new HttpError(404, "That recipe doesn't exist.");
     this.db.run("DELETE FROM recipes WHERE id = ?", id);
+    if (r.owner_id !== viewer.id) this.access!.audit(viewer, "recipe.remove", id, r.owner_id, { title: r.title });
   }
 }
 

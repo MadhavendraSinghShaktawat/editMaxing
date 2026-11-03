@@ -15,7 +15,7 @@ function saved() {
   const path = join(HOME, "dojo.db");
   if (!existsSync(path)) return [];
   const db = new DatabaseSync(path, { readOnly: true });
-  return db.prepare("SELECT name, status, mode, card FROM styles ORDER BY created_at").all() as { name: string; status: string; mode: string | null; card: string }[];
+  return db.prepare("SELECT name, status, card FROM styles ORDER BY created_at").all() as { name: string; status: string; card: string }[];
 }
 
 function check() {
@@ -52,7 +52,7 @@ function add() {
     console.error(`"${style.name}" is still a draft. Approve it in the Styles board first.`);
     process.exit(1);
   }
-  const shared = toSharedStyle({ name: style.name, mode: style.mode, card: JSON.parse(style.card) }, author);
+  const shared = toSharedStyle({ name: style.name, card: JSON.parse(style.card) }, author);
   const problems = checkSharedStyle(shared);
   if (problems.length) {
     console.error(`"${style.name}" isn't ready:\n${problems.map((p) => `  ${p}`).join("\n")}`);

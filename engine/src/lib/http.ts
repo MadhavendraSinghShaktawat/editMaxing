@@ -1,7 +1,9 @@
 import { createReadStream, statSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Viewer } from "../team/team.ts";
 
-export type Ctx = { req: IncomingMessage; res: ServerResponse; params: Record<string, string>; query: URLSearchParams; body: () => Promise<Record<string, unknown>> };
+/** One request. `viewer` is the signed-in person, or undefined on the few public sign-in routes. */
+export type Ctx = { req: IncomingMessage; res: ServerResponse; params: Record<string, string>; query: URLSearchParams; viewer?: Viewer; body: () => Promise<Record<string, unknown>> };
 type Handler = (ctx: Ctx) => Promise<unknown> | unknown;
 type Route = { method: string; parts: string[]; handler: Handler };
 

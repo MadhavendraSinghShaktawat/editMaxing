@@ -12,7 +12,8 @@ You build one thing for one moment: a graphic that explains what the speaker is 
 1. Read the brief. Note the job, the exact length and size, and where the clip must be saved.
 2. Watch the section. Read `section.mp4` frames with `view_frames`, and read `words.json`. Your timing comes from the speaker.
 3. Study the reference. Open every sequence sheet the brief lists. Each row is one moment, six frames left to right, so compare neighbours. Read the style and measurements.
-4. Write down, in a few lines, what you learned about its motion language: how things enter, how they settle, how fast, what keeps moving, its type, and how much is on screen at once. Design from those notes.
+4. If the brief has "Examples to follow", study each one: `examples/N.jpg` shows the move frame by frame, `examples/N.mp4` is the loop, and `examples/N.json` has its rebuild spec (layer, timing, easing, stagger, what it lands on, and the steps). Rebuild the mechanism with this section's words and content. Don't copy the reference's subject or text.
+5. Write down, in a few lines, what you learned about its motion language: how things enter, how they settle, how fast, what keeps moving, its type, and how much is on screen at once. Design from those notes.
 
 The reference sets the taste. Everything below is a default for when it says nothing.
 

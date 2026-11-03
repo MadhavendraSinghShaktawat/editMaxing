@@ -185,6 +185,10 @@ export function checkTool(name: string, input: Record<string, unknown>, workspac
     return { behavior: "ask", reason: `reads a file outside this mission: ${path}` };
   }
   if (name.startsWith("mcp__dojo__") || name.startsWith("mcp__earshot__") || name.startsWith("mcp__epidemic__")) return { behavior: "allow" };
+  // Envato's server only searches. Anything else it adds later has to be asked about first.
+  if (/^mcp__envato__search_[a-z0-9_]+$/.test(name)) return { behavior: "allow" };
+  // Scrape Creators only reads public posts. The person turned it on knowing it spends their credits.
+  if (name.startsWith("mcp__scrapecreators__")) return { behavior: "allow" };
   if (["Skill", "TodoWrite", "Task", "Agent", "WebSearch", "WebFetch", "ToolSearch", "BashOutput", "KillShell", "TaskOutput", "TaskStop", "ListAgents"].includes(name)) return { behavior: "allow" };
   return { behavior: "ask", reason: `uses ${name}` };
 }

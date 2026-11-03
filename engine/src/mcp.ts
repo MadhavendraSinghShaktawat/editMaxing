@@ -13,17 +13,26 @@ import type { Docs } from "./docs.ts";
 import type { Op } from "./editdoc.ts";
 import type { Files } from "./files.ts";
 import type { Library } from "./library.ts";
+import { BROLL_LAYOUTS, BROLL_ROLES } from "./library.ts";
 import { frameAt } from "./lib/media.ts";
 import { secrets } from "./lib/secrets.ts";
 import { paceOf, writeBrief } from "./motion.ts";
+import { SCRAPE_MCP, scrapeKeyFor } from "./social.ts";
+import { assemble, linesFrom } from "./story.ts";
+import { probe } from "./lib/media.ts";
 import { run } from "./lib/proc.ts";
 import { nativeBin } from "./config.ts";
+import type { Memory } from "./memory.ts";
+import type { MotionLibrary } from "./motionlib.ts";
+import { DOMAINS, LAYERS, OPERATIONS } from "./motionlib.ts";
 import type { Styles } from "./styles.ts";
 import type { Tools } from "./tools.ts";
 
 export const EPIDEMIC_URL = "https://www.epidemicsound.com/a/mcp-service/mcp";
+/** Envato's own MCP server for Envato Elements. Search only, with no sign-in: results link to Envato, where the person downloads and licenses. */
+export const ENVATO_URL = "https://mcp.envato.com/mcp";
 
-type Deps = { db: Database; chats: () => Chats; docs: Docs; files: Files; library: Library; styles: Styles; tools: Tools };
+type Deps = { db: Database; chats: () => Chats; docs: Docs; files: Files; library: Library; motion: MotionLibrary; styles: Styles; tools: Tools; memory: Memory; epidemicKey: (chat: ChatRow) => string; envato: (chat: ChatRow) => boolean; scrape: (chat: ChatRow) => boolean };
 type Result = { content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[]; isError?: boolean };
 
 const STAGES: Record<string, { station: Station; detail: string }> = {
@@ -82,7 +91,7 @@ const opSchema = z.discriminatedUnion("op", [
 /** What the reference's pace was, so a render can be compared with it. */
 function referencePace(chat: ChatRow, d: Deps) {
   const styleId = json<Brief>(chat.mission, {}).styleId;
-  const style = styleId ? d.styles.list().find((s) => s.id === styleId) : null;
+  const style = styleId ? (() => { try { return d.styles.get(styleId); } catch { return null; } })() : null;
   const measured = (style?.card as { measurements?: { pace?: unknown } } | undefined)?.measurements?.pace;
   if (measured) return measured;
   const root = join(chat.cwd, "work/reference");
@@ -96,6 +105,12 @@ function referencePace(chat: ChatRow, d: Deps) {
 
 export function dojoServer(chat: ChatRow, d: Deps) {
   const id = chat.id;
+  // Every library call runs as the person who owns this chat, so an editor only finds their footage.
+  const owner = chat.owner_id ?? "";
+  const shotFor = (shotId: string) => {
+    d.library.mustSeeShot(owner, shotId);
+    return d.library.shot(shotId);
+  };
   const chats = d.chats;
   const stored = async (path: string) => d.files.adopt(allowedPath(chat, path));
   const review = (body: string, at: number | null, kind: string, data?: unknown) => {
@@ -116,18 +131,35 @@ export function dojoServer(chat: ChatRow, d: Deps) {
         review(a.text, a.atSeconds ?? null, "call");
         return text("Logged.");
       })),
-      tool("ask_choice", "Pause and ask the user to pick. For B-roll, pass shotIds from search results so they see real filmstrips. Returns their pick.", {
+      tool("ask_choice", "Pause and ask the user to pick. For B-roll, pass shotIds from search results so they see real filmstrips. For motion graphics, pass animationIds from suggest_animations so they see the saved loops. Don't mix the two in one question. Returns their pick.", {
         question: z.string(), line: z.string().optional(),
-        options: z.array(z.object({ label: z.string(), detail: z.string().optional(), shotId: z.string().optional() })).min(2).max(6),
+        options: z.array(z.strictObject({ label: z.string(), detail: z.string().optional(), shotId: z.string().optional(), animationId: z.string().optional() })).min(2).max(6),
       }, safe(async (a, extra) => {
+        const shots = a.options.some((o) => o.shotId);
+        const anims = a.options.some((o) => o.animationId);
+        if (shots && anims) throw new Error("Ask about B-roll and animations in separate questions.");
         const options = a.options.map((o) => {
+          if (o.animationId) {
+            const v = d.motion.view(owner, o.animationId);
+            return { ...o, seconds: v.seconds, summary: v.summary, technique: v.technique?.label ?? null };
+          }
           if (!o.shotId) return o;
-          const s = d.library.shot(o.shotId);
+          const s = shotFor(o.shotId);
           return { ...o, seconds: s.t1 - s.t0, summary: s.card?.summary ?? "" };
         });
-        const answer = (await chats().ask(id, a.options.some((o) => o.shotId) ? "broll" : "choice", { question: a.question, line: a.line, options }, extra.signal)) as { label?: string; shotId?: string; note?: string } | null;
+        const answer = (await chats().ask(id, shots ? "broll" : anims ? "motion" : "choice", { question: a.question, line: a.line, options }, extra.signal)) as { label?: string; shotId?: string; animationId?: string; note?: string } | null;
         if (!answer) return text("The user didn't answer. Make the call yourself and log it.");
-        if (a.line) for (const o of a.options) if (o.shotId) d.library.logChoice(a.line, o.shotId, o.shotId === answer.shotId, id);
+        if (a.line) for (const o of a.options) if (o.shotId) d.library.logChoice(owner, a.line, o.shotId, o.shotId === answer.shotId, id);
+        for (const o of a.options) if (o.animationId) d.motion.logChoice(owner, a.line ?? a.question, o.animationId, o.animationId === answer.animationId, id);
+        // The person's own pick is the strongest taste signal there is. Memory compares it with what they passed over.
+        if (owner) {
+          const describe = (o: (typeof options)[number]) => ("summary" in o && o.summary ? `"${o.summary}"` : `"${o.label}"`);
+          const chosen = options.find((o) => (answer.shotId ? o.shotId === answer.shotId : answer.animationId ? o.animationId === answer.animationId : o.label === answer.label));
+          const passed = options.filter((o) => o !== chosen);
+          const kind = shots ? "broll_pick" : anims ? "motion_pick" : "message";
+          const said = chosen ? `Picked ${describe(chosen)}` : `Answered ${JSON.stringify(answer.note ?? answer.label ?? "")}`;
+          d.memory.signal({ memberId: owner, chatId: id, clientId: chat.client_id, kind, text: `${a.line ? `For the line ${JSON.stringify(a.line)}: ` : `${a.question} `}${said}. Passed over: ${passed.map(describe).join("; ") || "nothing"}.${answer.note ? ` Their note: ${JSON.stringify(answer.note)}` : ""}` });
+        }
         return text(answer);
       })),
 
@@ -135,12 +167,39 @@ export function dojoServer(chat: ChatRow, d: Deps) {
         const locale = a.locale ?? json<Brief>(chats().row(id).mission, {}).locale ?? "en-US";
         return text(await d.docs.open(id, allowedPath(chat, a.path), locale));
       })),
+      tool("read_clips", "Transcribe several raw clips on this Mac and read them as timed lines, to choose the best takes and story. Use it when there is more than one footage clip. Runs once per clip and is cached.", {
+        paths: z.array(z.string()).min(1).max(100).describe("Footage clips from inputs/, in the order they were attached."), locale: z.string().optional(),
+      }, safe(async (a) => {
+        const locale = a.locale ?? json<Brief>(chats().row(id).mission, {}).locale ?? "en-US";
+        const out: { clip: number; path: string; seconds: number; lines: ReturnType<typeof linesFrom> }[] = new Array(a.paths.length);
+        let next = 0;
+        // Two at a time: transcription is local and heavy, and the clips can be long.
+        await Promise.all([0, 1].map(async () => {
+          while (next < a.paths.length) {
+            const i = next++;
+            const f = await stored(a.paths[i]);
+            const [info, t] = await Promise.all([probe(f.path), d.tools.transcribe(f.hash, locale)]);
+            out[i] = { clip: i + 1, path: a.paths[i], seconds: Number(info.duration.toFixed(2)), lines: linesFrom(t.words) };
+          }
+        }));
+        return text({ clips: out, next: "Pick the takes that tell the best story, or follow the user's script line by line. Then join them with assemble_story and open the result with open_footage." });
+      })),
+      tool("assemble_story", "Join chosen takes from the raw clips, in order, into one video that becomes the main footage. Times are seconds in each clip, from read_clips. Leave a little air: start a take just before its first word and end it just after its last.", {
+        takes: z.array(z.strictObject({ path: z.string(), from: z.number(), to: z.number() })).min(1).max(200), note: z.string().describe("One line on the story you built, for the user."),
+      }, safe(async (a, extra) => {
+        const full = a.takes.map((t) => ({ path: allowedPath(chat, t.path), from: t.from, to: t.to }));
+        mkdirSync(join(chat.cwd, "work"), { recursive: true });
+        const name = `work/story-${Date.now().toString(36)}.mp4`;
+        const r = await assemble(full, join(chat.cwd, name), join(chat.cwd, "work"), extra.signal);
+        review(`Story: ${a.note}`, null, "call", { takes: a.takes });
+        return text({ path: name, seconds: r.seconds, takes: r.takes.map((t, i) => ({ ...a.takes[i], startsAt: t.start })), next: `Call open_footage with ${name}. It becomes the main video for every stage.` });
+      })),
       tool("get_edit_doc", "Read the transcript with word numbers, plus what is placed where. ~word~ means removed. Pass a range to save tokens.", { from: z.number().int().optional(), to: z.number().int().optional() }, safe(async (a) => text(d.docs.view(id, a.from, a.to)))),
       tool("analyze_takes", "Find repeated takes, false starts and filler words as word ranges. Judge them yourself before removing anything.", {}, safe(async () => text(d.docs.takes(id)))),
       tool("edit_ops", "Apply changes to the Edit Document. Every call saves a new version. from, to and word are word numbers from get_edit_doc. path is a file path from a tool result. For a library shot, give add_broll its shotId, or use use_clip to also record the pick for taste memory. An item's id comes from get_edit_doc.", { ops: z.array(opSchema), note: z.string() }, safe(async (a) => {
         const ops = a.ops.map((o) => {
           if (o.op === "add_broll" && o.shotId) {
-            const shot = d.library.shot(o.shotId);
+            const shot = shotFor(o.shotId);
             return { ...o, path: shot.path, in: o.in ?? shot.t0, label: o.label ?? shot.card?.summary?.slice(0, 60) };
           }
           return "path" in o && o.path ? { ...o, path: allowedPath(chat, o.path) } : o;
@@ -169,8 +228,11 @@ export function dojoServer(chat: ChatRow, d: Deps) {
       })),
       tool("brief_motion_agent", "Cut a section of the video out for the Motion agent. Packages the section, its timed words and the reference, and reserves those words. Make one brief per graphic. Then start the Motion agent once with the Agent tool, giving it every brief, and carry on with the rest of the edit.", {
         from: z.number().int(), to: z.number().int(), job: z.string().describe("What this graphic must explain, in a sentence or two."), kind: z.enum(["full_screen", "overlay"]).describe("full_screen replaces the picture. overlay is transparent and sits over the speaker."), notes: z.string().optional(),
+        examples: z.array(z.string()).max(3).optional().describe("Animation ids from suggest_animations for the Motion agent to rebuild on this section."),
       }, safe(async (a) => {
-        const brief = await writeBrief(chats().row(id), d.docs, d.styles, a);
+        const examples = (a.examples ?? []).map((e) => d.motion.example(owner, e));
+        const { examples: _ids, ...job } = a;
+        const brief = await writeBrief(chats().row(id), d.docs, d.styles, job, examples);
         return text({ ...brief, next: `Give the Motion agent this brief with the Agent tool: subagent_type "motion", prompt "Build ${brief.brief}". When it reports back, place ${brief.output} with add_graphic on words ${a.from}-${a.to}, with reservation "${brief.id}"${a.kind === "full_screen" ? " and hideCaptions true, because the clip shows the words itself" : ""}.` });
       })),
 
@@ -188,32 +250,57 @@ export function dojoServer(chat: ChatRow, d: Deps) {
         return { content: images };
       })),
 
+      tool("suggest_animations", "Find 3 to 5 saved animations for one moment, each a different technique. Name the job the moment needs, like 'make the 3x number land' or 'show the two options side by side'. Filters are optional; use them only when you're sure.", {
+        job: z.string().describe("What the moment needs to do for the viewer."), line: z.string().optional().describe("The spoken line it sits under."),
+        operation: z.enum(OPERATIONS.map((o) => o.id) as [string, ...string[]]).optional(), domain: z.enum(DOMAINS.map((o) => o.id) as [string, ...string[]]).optional(),
+        technique: z.string().optional(), layer: z.enum(LAYERS).optional(), count: z.number().int().min(3).max(5).optional(), exclude: z.array(z.string()).optional(),
+      }, safe(async (a) => {
+        const results = await d.motion.suggest(owner, { ...a, styleId: json<Brief>(chats().row(id).mission, {}).styleId ?? null });
+        return text(results.length ? { options: results, next: "Look at the ones you like with view_animation. Ask with ask_choice and animationIds when the pick matters, then pass the chosen ids to brief_motion_agent as examples." } : "No saved animations match. Learn a style from a reference to fill the Motion library, or brief the Motion agent from the style alone.");
+      })),
+      tool("view_animation", "See a saved animation frame by frame, left to right, with its rebuild spec.", { id: z.string() }, safe(async (a) => {
+        const strip = d.motion.file(owner, a.id, "strip");
+        const v = d.motion.mustUse(owner, a.id);
+        return { content: [{ type: "image", data: readFileSync(strip).toString("base64"), mimeType: "image/jpeg" }, { type: "text", text: JSON.stringify({ name: v.name, summary: v.summary, card: json(v.card, {}) }) }] };
+      })),
+      tool("browse_motion", "Show the Motion library's taxonomy: operations (the job), domains (the lever) and techniques (the move), with how many saved animations each has.", {}, safe(async () => {
+        const t = d.motion.taxonomy(owner);
+        return text({ operations: t.operations.map(({ id, label, description, count }) => ({ id, label, description, count })), domains: t.domains.map(({ id, label, count }) => ({ id, label, count })), techniques: t.techniques.filter((x) => x.count > 0).map(({ id, label, domain, count }) => ({ id, label, domain, count })) });
+      })),
+      tool("get_caption_preset", "The caption preset saved from this video's style, as a ready set_captions op plus the full caption notes. Check the font with list_fonts before applying it.", { id: z.string().optional().describe("A caption preset id, if the user picked a different one.") }, safe(async (a) => {
+        const preset = d.motion.captionPreset(owner, { id: a.id, styleId: json<Brief>(chats().row(id).mission, {}).styleId ?? null });
+        return text(preset ? { id: preset.id, name: preset.name, setCaptions: preset.card.setCaptions, notes: preset.card.captions } : "This video's style has no saved caption preset. Follow the Style Card's captions area.");
+      })),
+
       tool("search_broll", "Search the B-roll library. Write angles that think like an editor: literal, cause, effect, metaphor and contrast, not just the words in the line.", {
         line: z.string().describe("The spoken line this shot sits under."), angles: z.array(z.string()).min(1).max(6), collection: z.string().optional(),
         orientation: z.enum(["vertical", "horizontal"]).optional(), minSeconds: z.number().optional(), energy: z.enum(["calm", "lively"]).optional(),
+        role: z.enum(BROLL_ROLES).optional().describe("The job the shot must do: literal, proof, metaphor, contrast, list or texture."),
+        layout: z.enum(BROLL_LAYOUTS).optional().describe("Where it will sit, if not full screen."),
         exclude: z.array(z.string()).optional(), limit: z.number().int().max(12).optional(),
       }, safe(async (a) => {
-        const results = await d.library.search(a);
+        const results = await d.library.search(owner, a);
         if (!results.length) {
-          d.library.recordGap(a.line);
-          return text(d.library.stats().shots ? "Nothing matched. This gap was recorded." : "The B-roll library is empty.");
+          d.library.recordGap(owner, a.line);
+          return text(d.library.stats(owner).shots ? "Nothing matched. This gap was recorded." : "The B-roll library is empty.");
         }
         return text(results);
       })),
       tool("browse_library", "Show the library's category tree. Pass a path to go deeper or list shots.", { path: z.string().optional() }, safe(async (a) => {
-        const branches = d.library.tree(a.path ?? "");
-        return text({ branches, shots: a.path ? d.library.browse(a.path) : [] });
+        const branches = d.library.tree(owner, a.path ?? "");
+        return text({ branches, shots: a.path ? d.library.browse(owner, a.path) : [] });
       })),
-      tool("view_filmstrip", "See a shot's real frames. Use it before committing to a shot that matters.", { shotId: z.string() }, safe(async (a) => ({ content: [{ type: "image", data: d.library.filmstripData(a.shotId), mimeType: "image/jpeg" }] }))),
-      tool("find_similar", "Find shots that look like this one. Runs on this Mac.", { shotId: z.string(), limit: z.number().int().max(12).optional() }, safe(async (a) => text(d.library.similar(a.shotId, a.limit)))),
+      tool("view_filmstrip", "See a shot's real frames. Use it before committing to a shot that matters.", { shotId: z.string() }, safe(async (a) => (d.library.mustSeeShot(owner, a.shotId), { content: [{ type: "image", data: d.library.filmstripData(a.shotId), mimeType: "image/jpeg" }] }))),
+      tool("find_similar", "Find shots that look like this one. Runs on this Mac.", { shotId: z.string(), limit: z.number().int().max(12).optional() }, safe(async (a) => text(d.library.similar(owner, a.shotId, a.limit)))),
       tool("use_clip", "Place a library shot over a word range, and record the pick so the library learns this user's taste.", { shotId: z.string(), from: z.number().int(), to: z.number().int(), line: z.string() }, safe(async (a) => {
-        const s = d.library.shot(a.shotId);
+        const s = shotFor(a.shotId);
         const out = d.docs.apply(id, [{ op: "add_broll", from: a.from, to: a.to, path: s.path, in: s.t0, label: s.card?.summary?.slice(0, 60), shotId: a.shotId }], `B-roll on "${a.line.slice(0, 40)}"`);
-        d.library.logChoice(a.line, a.shotId, true, id);
+        d.library.logChoice(owner, a.line, a.shotId, true, id);
         return text(out);
       })),
       tool("log_choice", "Record that a shot was wrong for a line, so it ranks lower next time.", { shotId: z.string(), line: z.string() }, safe(async (a) => {
-        d.library.logChoice(a.line, a.shotId, false, id);
+        d.library.mustSeeShot(owner, a.shotId);
+        d.library.logChoice(owner, a.line, a.shotId, false, id);
         return text("Recorded.");
       })),
 
@@ -267,11 +354,23 @@ export async function mcpFor(chat: ChatRow, deps: Deps): Promise<Record<string, 
   const python = earshotPython();
   if (python) servers.earshot = { type: "stdio", command: python, args: ["-m", "earshot", "mcp"], env: { EARSHOT_THREADS: "3" } };
   // The key reaches Claude Code in its environment, never on a command line. See `epidemicEnv`.
-  if (await secrets.has("epidemic")) servers.epidemic = { type: "http", url: EPIDEMIC_URL, headers: { Authorization: "Bearer ${DOJO_EPIDEMIC_KEY}" } };
+  // Each person brings their own Epidemic key, because its licence can't be shared.
+  if (await secrets.has(deps.epidemicKey(chat))) servers.epidemic = { type: "http", url: EPIDEMIC_URL, headers: { Authorization: "Bearer ${DOJO_EPIDEMIC_KEY}" } };
+  // Each person connects Envato themselves, since an Elements licence belongs to whoever downloads.
+  if (deps.envato(chat)) servers.envato = { type: "http", url: ENVATO_URL };
+  // Scrape Creators spends the person's own credits, so it joins a chat only when they turned it on.
+  if (chat.owner_id && deps.scrape(chat) && (await secrets.has(scrapeKeyFor(chat.owner_id)))) servers.scrapecreators = { type: "http", url: SCRAPE_MCP, headers: { "x-api-key": "${DOJO_SCRAPECREATORS_KEY}" } };
   return servers;
 }
 
-export const epidemicEnv = async (): Promise<Record<string, string>> => {
-  const key = await secrets.get("epidemic");
+export const epidemicEnv = async (keyName: string): Promise<Record<string, string>> => {
+  const key = await secrets.get(keyName);
   return key ? { DOJO_EPIDEMIC_KEY: key } : {};
+};
+
+/** The person's Scrape Creators key, for a chat that has the tools turned on. */
+export const scrapeEnv = async (memberId: string | null, on: boolean): Promise<Record<string, string>> => {
+  if (!memberId || !on) return {};
+  const key = await secrets.get(scrapeKeyFor(memberId));
+  return key ? { DOJO_SCRAPECREATORS_KEY: key } : {};
 };

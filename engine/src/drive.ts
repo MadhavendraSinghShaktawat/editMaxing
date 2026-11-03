@@ -55,3 +55,42 @@ export async function downloadFile(files: Files, id: string, name: string, apiKe
   const disposition = res.headers.get("content-disposition")?.match(/filename="?([^";]+)"?/)?.[1];
   return files.fromStream(Readable.fromWeb(res.body as never), name || disposition || `${id}.mp4`);
 }
+
+const decode = (s: string) => s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+
+/** Reads Drive's public folder page: each entry's id, name, and whether it's a video or a folder. */
+export function parseFolderPage(html: string) {
+  const videos: { id: string; name: string }[] = [];
+  const folders: string[] = [];
+  for (const m of html.matchAll(/class="flip-entry" id="entry-([\w-]+)"[\s\S]*?href="([^"]+)"[\s\S]*?\/type\/([^"]+)"[\s\S]*?class="flip-entry-title">([^<]*)</g)) {
+    const [, id, href, type, name] = m;
+    if (/\/folders\//.test(href) || /folder/.test(type)) folders.push(id);
+    else if (/^video\//.test(type) || /\.(mp4|mov|m4v|mkv|webm|avi|mts|mxf)$/i.test(name)) videos.push({ id, name: decode(name.trim()) });
+  }
+  return { videos, folders };
+}
+
+/**
+ * Every video in a folder shared with "Anyone with the link", including subfolders. Uses the
+ * studio's Google key when there is one, and Drive's public folder page when there isn't.
+ */
+export async function folderVideos(id: string, apiKey: string | null, fetcher: typeof fetch = fetch) {
+  if (apiKey) return (await listFolder(id, apiKey, fetcher)).map((f) => ({ id: f.id, name: f.name }));
+  const out: { id: string; name: string }[] = [];
+  const queue = [id];
+  const seen = new Set(queue);
+  while (queue.length && seen.size <= 50) {
+    const folder = queue.shift()!;
+    await limiter.take();
+    const res = await fetcher(`https://drive.google.com/embeddedfolderview?id=${encodeURIComponent(folder)}`);
+    const html = res.ok ? await res.text() : "";
+    if (!html.includes("flip-entries")) {
+      if (folder === id) throw new Error("Google Drive won't show that folder. Set it to “Anyone with the link”.");
+      continue;
+    }
+    const page = parseFolderPage(html);
+    out.push(...page.videos);
+    for (const f of page.folders) if (!seen.has(f)) (seen.add(f), queue.push(f));
+  }
+  return out;
+}

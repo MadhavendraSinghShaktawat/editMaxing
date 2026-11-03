@@ -8,6 +8,7 @@ import type { Bus } from "../bus.ts";
 import { DIRS, TOOL_PATH, findBin } from "../config.ts";
 import type { Database } from "../db.ts";
 import { json } from "../db.ts";
+import { HttpError } from "../lib/http.ts";
 import { run } from "../lib/proc.ts";
 import { secrets } from "../lib/secrets.ts";
 
@@ -15,6 +16,7 @@ export type LimitWindow = { id: string; label: string; kind: "session" | "weekly
 
 export type Account = {
   id: string;
+  ownerId: string | null;
   label: string;
   kind: "subscription" | "api_key";
   configDir: string | null;
@@ -28,7 +30,7 @@ export type Account = {
 
 export type ModelOption = { id: string; name: string; description: string; resolved: string | null; efforts: string[]; fable: boolean };
 
-type Row = { id: string; label: string; kind: string; config_dir: string | null; email: string | null; plan: string | null; signed_in: number; models: string | null; limits: string | null; limits_at: number | null };
+type Row = { id: string; owner_id: string | null; label: string; kind: string; config_dir: string | null; email: string | null; plan: string | null; signed_in: number; models: string | null; limits: string | null; limits_at: number | null };
 
 const never = () =>
   (async function* () {
@@ -83,6 +85,7 @@ export class Accounts {
   private probing = new Map<string, Promise<void>>();
   private lastEvent = new Map<string, number>();
   private logins = new Map<string, () => void>();
+  private codes = new Map<string, (code: string) => void>();
   private timer: NodeJS.Timeout | null = null;
 
   constructor(db: Database, bus: Bus) {
@@ -92,7 +95,8 @@ export class Accounts {
 
   async init() {
     if (!this.db.get("SELECT id FROM accounts WHERE id = 'default'")) {
-      this.db.run("INSERT INTO accounts (id, label, config_dir, created_at) VALUES ('default', 'This Mac', NULL, ?)", Date.now());
+      // This Mac's own Claude login always belongs to the Owner. Nobody else can run on it.
+      this.db.run("INSERT INTO accounts (id, label, config_dir, created_at, owner_id) VALUES ('default', 'This Mac', NULL, ?, (SELECT id FROM members WHERE role = 'owner'))", Date.now());
     }
     await Promise.allSettled(this.list().map((a) => this.refresh(a.id)));
     this.timer = setInterval(() => void this.tick(), 60_000);
@@ -112,7 +116,7 @@ export class Accounts {
   }
 
   private toAccount(r: Row): Account {
-    return { id: r.id, label: r.label, kind: r.kind as Account["kind"], configDir: r.config_dir, email: r.email, plan: r.plan, signedIn: !!r.signed_in, models: json(r.models, []), limits: json(r.limits, []), limitsAt: r.limits_at };
+    return { id: r.id, ownerId: r.owner_id, label: r.label, kind: r.kind as Account["kind"], configDir: r.config_dir, email: r.email, plan: r.plan, signedIn: !!r.signed_in, models: json(r.models, []), limits: json(r.limits, []), limitsAt: r.limits_at };
   }
 
   list() {
@@ -122,6 +126,22 @@ export class Accounts {
   get(id: string) {
     const r = this.db.get<Row>("SELECT * FROM accounts WHERE id = ?", id);
     if (!r) throw new Error("That account no longer exists.");
+    return this.toAccount(r);
+  }
+
+  /** A person's own Claude logins. Usage is private, so nobody else's ever appears here. */
+  listFor(ownerId: string) {
+    return this.db.all<Row>("SELECT * FROM accounts WHERE owner_id = ? ORDER BY created_at", ownerId).map((r) => this.toAccount(r));
+  }
+
+  firstFor(ownerId: string) {
+    return this.db.get<{ id: string }>("SELECT id FROM accounts WHERE owner_id = ? AND signed_in = 1 ORDER BY created_at LIMIT 1", ownerId)?.id ?? null;
+  }
+
+  /** The same "not found" for someone else's account as for a missing one, so ids reveal nothing. */
+  owned(ownerId: string, id: string) {
+    const r = this.db.get<Row>("SELECT * FROM accounts WHERE id = ? AND owner_id = ?", id, ownerId);
+    if (!r) throw new HttpError(404, "That Claude account isn't one of yours.");
     return this.toAccount(r);
   }
 
@@ -145,17 +165,17 @@ export class Accounts {
     return { env: await this.env(id), pathToClaudeCodeExecutable: claudePath() };
   }
 
-  create(label: string, kind: Account["kind"]) {
+  create(ownerId: string, label: string, kind: Account["kind"]) {
     const id = randomUUID();
     const configDir = join(DIRS.accounts, id);
-    mkdirSync(configDir, { recursive: true });
-    this.db.run("INSERT INTO accounts (id, label, config_dir, kind, created_at) VALUES (?, ?, ?, ?, ?)", id, label, configDir, kind, Date.now());
+    mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    this.db.run("INSERT INTO accounts (id, label, config_dir, kind, created_at, owner_id) VALUES (?, ?, ?, ?, ?, ?)", id, label, configDir, kind, Date.now(), ownerId);
     this.emit(id);
     return this.get(id);
   }
 
-  async addApiKey(label: string, key: string) {
-    const a = this.create(label, "api_key");
+  async addApiKey(ownerId: string, label: string, key: string) {
+    const a = this.create(ownerId, label, "api_key");
     await secrets.set(`account:${a.id}`, key);
     await this.refresh(a.id);
     return this.get(a.id);
@@ -170,6 +190,7 @@ export class Accounts {
     this.logins.get(id)?.();
     const child = spawn(claudePath(), ["auth", "login", `--${mode}`], { env: await this.env(id), stdio: ["pipe", "pipe", "pipe"] });
     this.logins.set(id, () => child.kill("SIGTERM"));
+    this.codes.set(id, (code: string) => child.stdin.write(`${code}\n`));
     this.bus.emit("account.login", { id, status: "started", label: account.label });
     const scan = (chunk: Buffer) => {
       const url = chunk.toString("utf8").match(/https:\/\/\S+/)?.[0];
@@ -179,8 +200,21 @@ export class Accounts {
     child.stderr.on("data", scan);
     child.on("close", (code) => {
       this.logins.delete(id);
+      this.codes.delete(id);
       void this.refresh(id).then(() => this.bus.emit("account.login", { id, status: code === 0 ? "done" : "failed" }));
     });
+  }
+
+  /**
+   * On a Hub, the person signing in is usually on another computer, so Claude's page can't hand the
+   * login back to this Mac by itself. It shows a code instead, which they paste and Dojo passes to Claude Code.
+   */
+  submitCode(id: string, code: string) {
+    const clean = code.trim();
+    if (!/^[\w#\-.~]{8,512}$/.test(clean)) throw new HttpError(400, "That doesn't look like a sign-in code.");
+    const send = this.codes.get(id);
+    if (!send) throw new HttpError(409, "That sign-in already finished. Start it again.");
+    send(clean);
   }
 
   cancelLogin(id: string) {
@@ -203,7 +237,7 @@ export class Accounts {
     if (dir?.startsWith(resolve(DIRS.accounts) + sep)) rmSync(dir, { recursive: true, force: true });
     this.db.run("DELETE FROM chats WHERE account_id = ?", id);
     this.db.run("DELETE FROM accounts WHERE id = ?", id);
-    this.bus.emit("account.removed", { id });
+    this.bus.emit("account.removed", { id }, a.ownerId ? [a.ownerId] : "admins");
   }
 
   async refresh(id: string) {

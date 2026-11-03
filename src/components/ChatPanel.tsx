@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { Check, LogOut, Square, TriangleAlert, X } from "lucide-react";
+import { Brain, Check, LogOut, Square, TriangleAlert, X } from "lucide-react";
 import { STAGES, STARTERS } from "../sim/data";
+import { api } from "../sim/engine";
 import { Attachment, Decision, Editor, Message, stateLabel, store, useStore } from "../sim/store";
 import { AttachButton, AttachmentStrip, formatSize, formatTime, useAttachments } from "./Attach";
 import { DecisionCards } from "./Decisions";
 import { Icon } from "./Icon";
 import { ModelPicker } from "./ModelPicker";
 import { Filmstrip, Portrait } from "./Pixel";
+import { Button } from "./ui";
 
 function SentFile({ a }: { a: Attachment }) {
   return (
@@ -112,7 +114,29 @@ function RenderCard({ m }: { m: Message }) {
   );
 }
 
+/** Memory asks once, in one line, and the person decides with one tap. */
+function MemoryCard({ m }: { m: Message & { memory: NonNullable<Message["memory"]> } }) {
+  const s = useStore();
+  const rule = s.memory.find((r) => r.id === m.memory.ruleId);
+  const client = s.clients.find((c) => c.id === m.memory.clientId);
+  const decide = (choice: "personal" | "client" | "dismiss") => void s.attempt(() => api("POST", `/api/memory/${m.memory.ruleId}/confirm`, { choice }));
+  if (!rule) return <div className="msg-system">Memory: {m.text} (decided)</div>;
+  if (rule.status !== "suggested") return <div className="msg-system">Remembered: {rule.text}</div>;
+  return (
+    <div className="memory-card" role="group" aria-label="Memory suggestion">
+      <span><Brain size={13} /> Remember this?</span>
+      <b>{rule.text}</b>
+      <div>
+        <Button size="sm" variant="primary" onClick={() => decide("personal")}>Keep</Button>
+        {client && <Button size="sm" variant="secondary" onClick={() => decide("client")}>For {client.name}</Button>}
+        <Button size="sm" variant="ghost" onClick={() => decide("dismiss")}>Not now</Button>
+      </div>
+    </div>
+  );
+}
+
 function Bubble({ m, editor }: { m: Message; editor: Editor }) {
+  if (m.memory) return <MemoryCard m={m as Message & { memory: NonNullable<Message["memory"]> }} />;
   if (m.video) return <RenderCard m={m} />;
   if (m.error) return <div className="msg-system bad">{m.text}</div>;
   if (m.from === "system") return <div className="msg-system">{m.text}</div>;

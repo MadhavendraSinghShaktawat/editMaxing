@@ -105,7 +105,7 @@ That's the whole team: one editor and one Motion agent per chat. No other agents
 
 ## How an edit works
 
-1. **Brief it.** Upload your footage, choose a mode (YouTube explainer, tutorial, vlog or review, or an Instagram reel or explainer) and, if you like, a style. Say what you want in a sentence.
+1. **Brief it.** Upload your footage, pick one of your styles if you like, and say what you want in a sentence.
 2. **The editor works through five stages.** A-cuts, B-roll, captions and animation, motion graphics, then sound. Every change goes into one edit document anchored to the words, so a later change never breaks an earlier one.
 3. **It checks its own work.** It renders a preview, looks at the frames that matter, and compares the pace with the reference before the final render.
 4. **You get the files.** An MP4, an SRT and an FCPXML, plus a short summary of the calls worth a second look. Ask for changes in plain words, or bring back any earlier version.
@@ -131,6 +131,17 @@ Give Shifu Dojo a reference video and it measures the edit on your Mac first: ev
 
 Every rule cites the moments it came from, and you approve the card before it's used. Colour grading is left out for now.
 
+The same study also fills the **Motion library**: each animation in the reference is saved as a short loop with a spec the Motion agent can rebuild on anyone's video, along with the caption preset and one thumbnail frame. Animations are sorted by what they do rather than how they look, as in Jason Murray's taxonomy of visuals:
+
+| Level | Question | Examples |
+|---|---|---|
+| Operation | What job does it do? | Emphasize, Explain, Compare, Prove, Reveal, Sequence, Move on, Reset attention |
+| Domain | Which lever does it pull? | Type, Camera, Layout, Depth, Graphic, Time |
+| Technique | What's the move? | Word pop, Push-in, Split screen, Behind-subject plate, Card builds row by row |
+| Execution | A real example | The saved loop, with its source and timing |
+
+When an editor reaches a graphic, it asks the library for three to five options that each use a different technique, and you can pick from the loops in chat. When Claude finds a technique that isn't on the list, it proposes it and an admin approves it.
+
 </details>
 
 ## What's inside
@@ -153,6 +164,7 @@ Every rule cites the moments it came from, and you approve the card before it's 
 <li>Shot detection, colour, motion, sharpness, on-screen text and faces, all measured locally</li>
 <li>Claude writes a short meaning card for each clip, in batches you control</li>
 <li>Search by meaning, keyword and filters together, and it learns from your picks</li>
+<li>Each shot also records the job it does (literal, proof, metaphor, contrast, list or texture) and where it fits (full screen, half of a split, a small window, behind the speaker)</li>
 </ul>
 </details>
 <details>
@@ -238,6 +250,7 @@ Add these in **Settings**. They go to the macOS Keychain and are never shown aga
 | OpenRouter | Embeddings for B-roll meaning search. Only text is sent. | For meaning search. Keyword search works without it. |
 | Google | Listing Google Drive folders | Only for folder links. File links work without it. |
 | Epidemic Sound | Music and effects | Optional. The bundled CC0 effects are always free. |
+| Scrape Creators | Paste a TikTok, Instagram, Facebook, X, Threads, Reddit, Snapchat, Pinterest, Bluesky, Truth Social, Twitch, Kick or Rumble link as your footage, a reference, or a new style. Optionally gives editors its lookup tools in chat. Each person adds their own key. | Optional. About 1 credit a link. YouTube and LinkedIn links aren't supported, because Scrape Creators returns their details but not the video. |
 
 </details>
 

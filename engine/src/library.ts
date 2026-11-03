@@ -16,10 +16,22 @@ import { BKTree, UnionFind, cosine, editDistance, mmr, reciprocalRank, topK } fr
 import { detectShots, filmstrip, frameAt, probe } from "./lib/media.ts";
 import { run } from "./lib/proc.ts";
 import { secrets } from "./lib/secrets.ts";
+import { HttpError } from "./lib/http.ts";
+import type { Access, Grant } from "./team/access.ts";
+import type { Viewer } from "./team/team.ts";
+
+/** What a shot does in an edit, apart from what it shows. Search can ask for "proof" instead of "a laptop". */
+export const BROLL_ROLES = ["literal", "proof", "metaphor", "contrast", "list", "texture"] as const;
+/** Where a shot can sit in the frame. */
+export const BROLL_LAYOUTS = ["full_screen", "split_half", "picture_in_picture", "behind_subject", "background_plate"] as const;
+export type BrollRole = (typeof BROLL_ROLES)[number];
+export type BrollLayout = (typeof BROLL_LAYOUTS)[number];
 
 export type Card = {
   id: string; summary: string; subject: string; action: string; objects: string[]; setting: string; lighting: string; camera: string;
   people: string; mood: string[]; meanings: string[]; goodFor: string[]; avoid: string[]; visibleText: string; category: string[];
+  /** Older cards were written before these existed, so both are optional when read. */
+  role?: BrollRole; layouts?: BrollLayout[];
 };
 
 type ShotRow = {
@@ -35,7 +47,7 @@ const CARD_SCHEMA = {
       type: "array",
       items: {
         type: "object",
-        required: ["id", "summary", "subject", "action", "objects", "setting", "lighting", "camera", "people", "mood", "meanings", "goodFor", "avoid", "visibleText", "category"],
+        required: ["id", "summary", "subject", "action", "objects", "setting", "lighting", "camera", "people", "mood", "meanings", "goodFor", "avoid", "visibleText", "category", "role", "layouts"],
         properties: {
           id: { type: "string" },
           summary: { type: "string", description: "Two precise sentences on exactly what is visible." },
@@ -52,6 +64,8 @@ const CARD_SCHEMA = {
           avoid: { type: "array", items: { type: "string" } },
           visibleText: { type: "string" },
           category: { type: "array", items: { type: "string" }, description: "Two or three levels from broad to narrow, like People, Working, At a desk." },
+          role: { type: "string", enum: [...BROLL_ROLES], description: "The job this shot does best in an edit: literal (shows exactly what's said), proof (evidence such as a screen, document, result or number), metaphor (stands for an idea), contrast (the opposite, for a before/after or a twist), list (one of a set, for montages and steps), texture (atmosphere that lets a moment breathe)." },
+          layouts: { type: "array", items: { type: "string", enum: [...BROLL_LAYOUTS] }, description: "Where it can sit: full screen, one half of a split, a small window, behind a cut-out speaker, or a soft background plate. Judge from framing, empty space and how busy it is." },
         },
       },
     },
@@ -75,7 +89,7 @@ function jaccard(a: Set<string>, b: Set<string>) {
 const wordSet = (s: string) => new Set(norm(s).split(" ").filter((w) => w.length > 2));
 
 export function meaningText(c: Card) {
-  return [c.summary, c.subject, c.action, c.objects.join(", "), c.setting, c.mood.join(", "), `Implies: ${c.meanings.join(", ")}`, `Good for: ${c.goodFor.join("; ")}`].join(". ");
+  return [c.summary, c.subject, c.action, c.objects.join(", "), c.setting, c.mood.join(", "), `Implies: ${c.meanings.join(", ")}`, c.role ? `Role: ${c.role}` : "", `Good for: ${c.goodFor.join("; ")}`].filter(Boolean).join(". ");
 }
 
 export function validCard(c: Partial<Card> | undefined): c is Card {
@@ -87,7 +101,21 @@ export function nextBatch(size: number, ok: boolean, max: number) {
   return ok ? Math.min(max, size + 10) : Math.max(10, Math.floor(size / 2));
 }
 
+export type LibraryView = {
+  id: string; name: string; ownerId: string; access: "own" | "add" | "use"; clips: number; sharedWith: Grant[]; drive: boolean; createdAt: number;
+};
+
+type IngestJob = { hash: string; libraryId: string; collection: string; source: string | null; rights: string | null };
+
+/** Someone acting on the library: the person, and whether an editor is acting for them. */
+const asViewer = (memberId: string): Viewer => ({ id: memberId, name: "", role: "editor", via: "session" });
+
 export class Library {
+  /** Set at startup, so sharing rules live in one place. */
+  access: Access | null = null;
+  /** Called when a shared library gets new clips, so they reach the company Drive. */
+  onSharedChange: (libraryId: string) => void = () => {};
+
   private db: Database;
   private bus: Bus;
   private files: Files;
@@ -105,8 +133,8 @@ export class Library {
     this.jobs = jobs;
     this.accounts = accounts;
     this.isBusy = isBusy;
-    jobs.register<{ hash: string; collection: string; source: string | null; rights: string | null }>("library.ingest", (p, ctx) => this.ingest(p, ctx));
-    jobs.register<{ links: string[]; collection: string; rights: string | null }>("library.drive", (p, ctx) => this.importDrive(p, ctx));
+    jobs.register<IngestJob>("library.ingest", (p, ctx) => this.ingest(p, ctx));
+    jobs.register<{ links: string[]; libraryId: string; collection: string; rights: string | null }>("library.drive", (p, ctx) => this.importDrive(p, ctx));
     jobs.register<{ count: number; accountId: string; model: string; collection: string | null }>("library.analyze", (p, ctx) => this.analyze(p, ctx));
     jobs.register<Record<string, never>>("library.embed", (_, ctx) => this.embedPending(ctx));
   }
@@ -116,14 +144,156 @@ export class Library {
     return this.db.setting("embed_model") ?? "google/gemini-embedding-2";
   }
 
-  enqueue(hash: string, collection = "general", source: string | null = null, rights: string | null = null) {
-    return this.jobs.add("library.ingest", { hash, collection, source, rights }, { lane: "heavy", priority: 6 });
+  // ── Libraries ────────────────────────────────────────────────
+
+  private libraryRow(id: string) {
+    const r = this.db.get<{ id: string; owner_id: string; name: string; drive_folder_id: string | null; created_at: number; removed_at: number | null }>("SELECT * FROM libraries WHERE id = ?", id);
+    if (!r || r.removed_at) throw new HttpError(404, "That library doesn't exist.");
+    return r;
   }
 
-  private async ingest(p: { hash: string; collection: string; source: string | null; rights: string | null }, ctx: JobContext) {
+  private toLibrary(r: { id: string; owner_id: string; name: string; drive_folder_id: string | null; created_at: number }, viewerId: string): LibraryView {
+    const clips = this.db.get<{ n: number }>("SELECT COUNT(*) n FROM library_clips lc JOIN clips c ON c.id = lc.clip_id WHERE lc.library_id = ? AND c.status = 'ready'", r.id)!.n;
+    const granted = r.owner_id === viewerId ? null : this.access!.granted("library", r.id, viewerId);
+    return { id: r.id, name: r.name, ownerId: r.owner_id, access: r.owner_id === viewerId ? "own" : granted === "add" ? "add" : "use", clips, sharedWith: this.access!.grants("library", r.id), drive: !!r.drive_folder_id, createdAt: r.created_at };
+  }
+
+  /** Libraries this person can use: their own first, then ones shared with them. */
+  libraries(viewerId: string) {
+    const ids = this.visibleLibraries(viewerId);
+    if (!ids.length) return [];
+    return this.db.all<{ id: string; owner_id: string; name: string; drive_folder_id: string | null; created_at: number }>(`SELECT * FROM libraries WHERE id IN (${ids.map(() => "?").join(",")}) ORDER BY owner_id = ? DESC, created_at`, ...ids, viewerId).map((r) => this.toLibrary(r, viewerId));
+  }
+
+  /** One member's own libraries, for admins in Settings → Users. */
+  ownedBy(memberId: string) {
+    return this.db.all<{ id: string; owner_id: string; name: string; drive_folder_id: string | null; created_at: number }>("SELECT * FROM libraries WHERE owner_id = ? AND removed_at IS NULL ORDER BY created_at", memberId).map((r) => this.toLibrary(r, memberId));
+  }
+
+  private visibleLibraries(viewerId: string) {
+    return this.access!.visible("library", asViewer(viewerId));
+  }
+
+  /** Every person starts with one library, so uploads always have somewhere to go. */
+  defaultLibrary(viewerId: string) {
+    const own = this.db.get<{ id: string }>("SELECT id FROM libraries WHERE owner_id = ? AND removed_at IS NULL ORDER BY created_at LIMIT 1", viewerId);
+    if (own) return own.id;
+    const id = randomUUID();
+    this.db.run("INSERT INTO libraries (id, owner_id, name, created_at) VALUES (?, ?, 'My B-roll', ?)", id, viewerId, Date.now());
+    return id;
+  }
+
+  createLibrary(viewer: Viewer, name: string) {
+    const clean = name?.trim().slice(0, 80);
+    if (!clean) throw new HttpError(400, "Give the library a name.");
+    const id = randomUUID();
+    this.db.run("INSERT INTO libraries (id, owner_id, name, created_at) VALUES (?, ?, ?, ?)", id, viewer.id, clean, Date.now());
+    this.changed(id);
+    return this.toLibrary(this.libraryRow(id), viewer.id);
+  }
+
+  renameLibrary(viewer: Viewer, id: string, name: string) {
+    this.access!.require(viewer, "library", id, "own");
+    const clean = name?.trim().slice(0, 80);
+    if (!clean) throw new HttpError(400, "Give the library a name.");
+    this.db.run("UPDATE libraries SET name = ? WHERE id = ?", clean, id);
+    this.changed(id);
+  }
+
+  /** Removing a library keeps its clips for anyone else's library that holds them, and keeps the analysis. */
+  removeLibrary(viewer: Viewer, id: string, asAdmin = false) {
+    const r = this.libraryRow(id);
+    if (!(asAdmin && (viewer.role === "owner" || viewer.role === "admin"))) this.access!.require(viewer, "library", id, "own");
+    const audience = this.access!.audience("library", id);
+    this.db.tx(() => {
+      this.db.run("UPDATE libraries SET removed_at = ? WHERE id = ?", Date.now(), id);
+      this.db.run("DELETE FROM shares WHERE resource_type = 'library' AND resource_id = ?", id);
+      this.db.run("DELETE FROM library_clips WHERE library_id = ?", id);
+    });
+    if (asAdmin) this.access!.audit(viewer, "library.remove", id, r.owner_id, { name: r.name });
+    this.loaded = false;
+    this.bus.emit("library", { changed: id }, audience);
+  }
+
+  share(viewer: Viewer, id: string, grants: Grant[]) {
+    const before = this.access!.audience("library", id);
+    const { isShared } = this.access!.setGrants(viewer, "library", id, grants);
+    const after = this.access!.audience("library", id);
+    this.bus.emit("library", { changed: id }, before === "*" || after === "*" ? "*" : [...new Set([...before, ...after])]);
+    if (isShared) this.onSharedChange(id);
+    return this.toLibrary(this.libraryRow(id), viewer.id);
+  }
+
+  isShared(id: string) {
+    return !!this.db.get("SELECT 1 FROM shares WHERE resource_type = 'library' AND resource_id = ?", id);
+  }
+
+  /** Removes one clip from one library. The analysis stays, so adding it back later is free. */
+  removeClip(viewer: Viewer, libraryId: string, clipId: string, asAdmin = false) {
+    const r = this.libraryRow(libraryId);
+    if (!(asAdmin && (viewer.role === "owner" || viewer.role === "admin"))) this.access!.require(viewer, "library", libraryId, "own");
+    this.db.run("DELETE FROM library_clips WHERE library_id = ? AND clip_id = ?", libraryId, clipId);
+    if (asAdmin) this.access!.audit(viewer, "library.clip.remove", clipId, r.owner_id, { library: libraryId });
+    this.loaded = false;
+    this.changed(libraryId);
+  }
+
+  private changed(libraryId: string) {
+    this.bus.emit("library", { changed: libraryId }, this.access!.audience("library", libraryId));
+  }
+
+  /** Clip ids someone can use in a search or an edit. */
+  private visibleClips(viewerId: string) {
+    const libs = this.visibleLibraries(viewerId);
+    if (!libs.length) return new Set<string>();
+    return new Set(this.db.all<{ clip_id: string }>(`SELECT DISTINCT clip_id FROM library_clips WHERE library_id IN (${libs.map(() => "?").join(",")})`, ...libs).map((r) => r.clip_id));
+  }
+
+  /**
+   * Shots someone can use. A near-copy of a shot is stored once, so when only the copy is in their
+   * libraries, it stands in for the original and borrows its analysis.
+   */
+  private visibleShots(viewerId: string) {
+    const clips = this.visibleClips(viewerId);
+    const stand = new Map<string, string>();
+    if (!clips.size) return stand;
+    const marks = [...clips].map(() => "?").join(",");
+    for (const r of this.db.all<{ id: string; duplicate_of: string | null }>(`SELECT id, duplicate_of FROM shots WHERE clip_id IN (${marks})`, ...clips)) {
+      const canonical = r.duplicate_of ?? r.id;
+      if (!stand.has(canonical) || canonical === r.id) stand.set(canonical, r.id);
+    }
+    return stand;
+  }
+
+  /** Throws unless this person can use the shot. Editors only see shots from their own searches. */
+  mustSeeShot(viewerId: string, shotId: string) {
+    const r = this.db.get<{ clip_id: string }>("SELECT clip_id FROM shots WHERE id = ?", shotId);
+    if (!r || !this.visibleClips(viewerId).has(r.clip_id)) throw new Error(`No shot with id ${shotId}.`);
+  }
+
+  enqueue(viewer: Viewer, hash: string, libraryId: string | null, collection = "general", source: string | null = null, rights: string | null = null) {
+    const target = libraryId ?? this.defaultLibrary(viewer.id);
+    this.access!.require(viewer, "library", target, "add");
+    return this.jobs.add("library.ingest", { hash, libraryId: target, collection, source, rights } satisfies IngestJob, { lane: "heavy", priority: 6, owner: viewer.id });
+  }
+
+  private addToLibrary(libraryId: string, clipId: string, by: string | null) {
+    const added = this.db.run("INSERT OR IGNORE INTO library_clips (library_id, clip_id, added_by, added_at) VALUES (?, ?, ?, ?)", libraryId, clipId, by, Date.now());
+    if (added.changes) {
+      this.loaded = false;
+      this.changed(libraryId);
+      if (this.isShared(libraryId)) this.onSharedChange(libraryId);
+    }
+  }
+
+  private async ingest(p: IngestJob, ctx: JobContext) {
     const file = this.files.get(p.hash);
     const known = this.db.get<{ id: string; status: string }>("SELECT id, status FROM clips WHERE file_hash = ?", p.hash);
-    if (known?.status === "ready") return { clip: known.id, skipped: true };
+    // The same file is analysed once, however many libraries it ends up in.
+    if (known?.status === "ready") {
+      if (p.libraryId) this.addToLibrary(p.libraryId, known.id, ctx.owner);
+      return { clip: known.id, skipped: true };
+    }
     const info = await probe(file.path);
     if (!info.hasVideo) throw new Error(`${file.name} has no video.`);
     const clip = known?.id ?? randomUUID();
@@ -166,11 +336,13 @@ export class Library {
       this.db.run("UPDATE clips SET status = 'ready', error = NULL WHERE id = ?", clip);
     });
     this.loaded = false;
-    this.bus.emit("library", this.stats());
+    if (p.libraryId) this.addToLibrary(p.libraryId, clip, ctx.owner);
     return { clip, shots: shots.length, seconds: info.duration };
   }
 
-  async importDrive(p: { links: string[]; collection: string; rights: string | null }, ctx: JobContext) {
+  async importDrive(p: { links: string[]; libraryId: string; collection: string; rights: string | null }, ctx: JobContext) {
+    if (!ctx.owner) throw new Error("This import has no owner. Start it again.");
+    const owner = asViewer(ctx.owner);
     const apiKey = await secrets.get("google_api_key");
     const targets: { id: string; name: string }[] = [];
     const failed: string[] = [];
@@ -187,7 +359,8 @@ export class Library {
       ctx.progress(i / targets.length, `Downloading ${i + 1} of ${targets.length}`);
       try {
         const f = await downloadFile(this.files, t.id, t.name, apiKey, ctx.signal);
-        this.enqueue(f.hash, p.collection, `drive:${t.id}`, p.rights);
+        this.grantFile(ctx.owner, f.hash);
+        this.enqueue(owner, f.hash, p.libraryId, p.collection, `drive:${t.id}`, p.rights);
         imported.push(f.name);
       } catch (e) {
         failed.push((e as Error).message);
@@ -196,10 +369,23 @@ export class Library {
     return { imported, failed };
   }
 
-  stats() {
-    const row = this.db.get<{ clips: number }>("SELECT COUNT(*) clips FROM clips WHERE status = 'ready'")!;
-    const s = this.db.get<{ shots: number; carded: number; embedded: number }>(`SELECT COUNT(*) shots, COUNT(card) carded, SUM(embedding IS NOT NULL) embedded FROM shots WHERE duplicate_of IS NULL`)!;
-    return { clips: row.clips, shots: s.shots, analyzed: s.carded, embedded: s.embedded ?? 0, pending: s.shots - s.carded, percentPerShot: this.percentPerShot() };
+  grantFile(memberId: string, hash: string) {
+    this.db.run("INSERT OR IGNORE INTO file_access (hash, member_id, created_at) VALUES (?, ?, ?)", hash, memberId, Date.now());
+  }
+
+  /** Counts over the libraries this person can use. */
+  stats(viewerId: string) {
+    const stand = this.visibleShots(viewerId);
+    const clips = this.visibleClips(viewerId);
+    const ready = clips.size ? this.db.get<{ n: number }>(`SELECT COUNT(*) n FROM clips WHERE status = 'ready' AND id IN (${[...clips].map(() => "?").join(",")})`, ...clips)!.n : 0;
+    let analyzed = 0;
+    let embedded = 0;
+    for (const canonical of stand.keys()) {
+      const r = this.db.get<{ card: string | null; embedding: Uint8Array | null }>("SELECT card, embedding FROM shots WHERE id = ?", canonical);
+      if (r?.card) analyzed++;
+      if (r?.embedding) embedded++;
+    }
+    return { clips: ready, shots: stand.size, analyzed, embedded, pending: stand.size - analyzed, percentPerShot: this.percentPerShot() };
   }
 
   /** Average session percent one shot costs, measured from real batches on this account. */
@@ -209,16 +395,34 @@ export class Library {
     return r?.units && r.amount > 0 ? r.amount / r.units : null;
   }
 
-  clips() {
-    return this.db.all<{ id: string; name: string; collection: string; duration: number; status: string; rights: string | null; shots: number; analyzed: number }>(`SELECT c.id, c.name, c.collection, c.duration, c.status, c.rights, COUNT(s.id) shots, COUNT(s.card) analyzed FROM clips c LEFT JOIN shots s ON s.clip_id = c.id GROUP BY c.id ORDER BY c.created_at DESC`);
+  /** Clips in one library, or in all the libraries this person can use. */
+  clips(viewerId: string, libraryId?: string | null) {
+    const libs = libraryId ? (this.access!.require(asViewer(viewerId), "library", libraryId, "use"), [libraryId]) : this.visibleLibraries(viewerId);
+    if (!libs.length) return [];
+    return this.db.all<{ id: string; name: string; collection: string; duration: number; status: string; rights: string | null; shots: number; analyzed: number; library_id: string }>(
+      `SELECT c.id, c.name, c.collection, c.duration, c.status, c.rights, lc.library_id, COUNT(s.id) shots, COUNT(COALESCE(s.card, d.card)) analyzed
+       FROM library_clips lc JOIN clips c ON c.id = lc.clip_id LEFT JOIN shots s ON s.clip_id = c.id LEFT JOIN shots d ON d.id = s.duplicate_of
+       WHERE lc.library_id IN (${libs.map(() => "?").join(",")}) GROUP BY c.id, lc.library_id ORDER BY lc.added_at DESC`,
+      ...libs,
+    ).map((c) => ({ id: c.id, name: c.name, collection: c.collection, duration: c.duration, status: c.status, rights: c.rights, shots: c.shots, analyzed: c.analyzed, libraryId: c.library_id }));
   }
 
-  private pendingShots(limit: number, collection: string | null) {
-    return this.db.all<ShotRow>(`SELECT s.* FROM shots s JOIN clips c ON c.id = s.clip_id WHERE s.card IS NULL AND s.duplicate_of IS NULL AND (? IS NULL OR c.collection = ?) ORDER BY s.created_at, s.t0 LIMIT ?`, collection, collection, limit);
+  /** Shots still waiting for a card, from libraries this person can add to, so their plan pays for their own footage. */
+  private pendingShots(limit: number, collection: string | null, viewerId: string) {
+    const libs = this.visibleLibraries(viewerId).filter((l) => this.access!.can(asViewer(viewerId), "library", l, "add"));
+    if (!libs.length) return [];
+    return this.db.all<ShotRow>(
+      `SELECT DISTINCT o.* FROM library_clips lc JOIN clips c ON c.id = lc.clip_id JOIN shots s ON s.clip_id = c.id JOIN shots o ON o.id = COALESCE(s.duplicate_of, s.id)
+       WHERE lc.library_id IN (${libs.map(() => "?").join(",")}) AND o.card IS NULL AND o.duplicate_of IS NULL AND (? IS NULL OR c.collection = ?)
+       ORDER BY o.created_at, o.t0 LIMIT ?`,
+      ...libs, collection, collection, limit,
+    );
   }
 
   /** Writes cards in growing batches. Each batch is a fresh call, so nothing compounds. */
   private async analyze(p: { count: number; accountId: string; model: string; collection: string | null }, ctx: JobContext) {
+    if (!ctx.owner) throw new Error("This analysis has no owner. Start it again.");
+    const owner = ctx.owner;
     let size = 10;
     const maxBatch = Number(this.db.setting("max_card_batch") ?? 40);
     const ceiling = Number(this.db.setting("usage_ceiling") ?? 85);
@@ -226,14 +430,14 @@ export class Library {
     let failedStreak = 0;
     while (done < p.count && !ctx.signal.aborted) {
       await this.waitForTurn(p.accountId, ceiling, ctx);
-      const batch = this.pendingShots(Math.min(size, p.count - done), p.collection);
+      const batch = this.pendingShots(Math.min(size, p.count - done), p.collection, owner);
       if (!batch.length) break;
       await this.accounts.probe(p.accountId).catch(() => {});
       const before = this.accounts.session(p.accountId)?.usedPercent ?? null;
       ctx.progress(done / p.count, `Claude is studying ${batch.length} shots`);
       const good = await this.cardBatch(batch, p, ctx).catch((e: Error) => {
         if (ctx.signal.aborted) throw e;
-        this.bus.emit("library.warning", { message: e.message });
+        this.bus.emit("library.warning", { message: e.message }, [owner]);
         return 0;
       });
       done += good;
@@ -243,10 +447,10 @@ export class Library {
       if (failedStreak >= 3) throw new Error("Claude couldn't analyze these shots after three tries.");
       await this.accounts.probe(p.accountId).catch(() => {});
       const after = this.accounts.session(p.accountId)?.usedPercent ?? null;
-      if (before !== null && after !== null && good && after >= before) this.db.run("INSERT INTO usage_notes (kind, amount, units, created_at) VALUES ('card', ?, ?, ?)", after - before, good, Date.now());
-      this.bus.emit("library", this.stats());
+      if (before !== null && after !== null && good && after >= before) this.db.run("INSERT INTO usage_notes (kind, amount, units, created_at, member_id) VALUES ('card', ?, ?, ?, ?)", after - before, good, Date.now(), owner);
+      this.bus.emit("library", { analyzed: good }, [owner]);
     }
-    if (await secrets.has("openrouter")) this.jobs.add("library.embed", {}, { lane: "light" });
+    if (await secrets.has("openrouter")) this.jobs.add("library.embed", {}, { lane: "light", owner });
     return { analyzed: done };
   }
 
@@ -301,7 +505,7 @@ export class Library {
       ctx.progress(0.5, `Embedded ${total} shots`);
     }
     this.loaded = false;
-    this.bus.emit("library", this.stats());
+    this.bus.emit("library", { embedded: total }, ctx.owner ? [ctx.owner] : "admins");
     return { embedded: total };
   }
 
@@ -317,38 +521,43 @@ export class Library {
     this.loaded = true;
   }
 
-  private keyword(text: string, limit: number) {
+  private keyword(text: string, limit: number, allowed: Map<string, string>) {
     const terms = norm(text).split(" ").filter((w) => w.length > 2).slice(0, 12);
-    if (!terms.length) return [];
-    return this.db.all<{ shot_id: string }>(`SELECT shot_id FROM shots_fts WHERE shots_fts MATCH ? ORDER BY bm25(shots_fts) LIMIT ?`, terms.map((t) => `"${t}"`).join(" OR "), limit).map((r) => r.shot_id);
+    if (!terms.length || !allowed.size) return [];
+    // Ranked over everything, then filtered, so other people's footage can't push yours out of the top results.
+    return this.db.all<{ shot_id: string }>(`SELECT shot_id FROM shots_fts WHERE shots_fts MATCH ? ORDER BY bm25(shots_fts) LIMIT ?`, terms.map((t) => `"${t}"`).join(" OR "), limit * 20).map((r) => r.shot_id).filter((id) => allowed.has(id)).slice(0, limit);
   }
 
   /**
    * Search takes several creative angles, written by Claude for one spoken line. Vector and keyword
    * lists are fused per angle, then taste, usage and filters adjust the order and MMR removes near copies.
    */
-  async search(params: { line: string; angles: string[]; collection?: string; orientation?: "vertical" | "horizontal"; minSeconds?: number; energy?: "calm" | "lively"; exclude?: string[]; limit?: number }) {
+  async search(viewerId: string, params: { line: string; angles: string[]; collection?: string; orientation?: "vertical" | "horizontal"; minSeconds?: number; energy?: "calm" | "lively"; role?: BrollRole; layout?: BrollLayout; exclude?: string[]; limit?: number }) {
     this.load();
     const limit = params.limit ?? 8;
+    const allowed = this.visibleShots(viewerId);
+    if (!allowed.size) return [];
     const key = this.vectors.size ? await secrets.get("openrouter") : null;
     const lists: string[][] = [];
     const queries = [...new Set([...params.angles, params.line].filter(Boolean))];
     if (key) {
       const vectors = await embed(queries, this.embedModel, key);
-      for (const q of vectors) lists.push(topK(this.vectors.entries(), 40, ([, v]) => cosine(q, v)).map((r) => r.v[0]));
+      const mine = [...this.vectors.entries()].filter(([id]) => allowed.has(id));
+      for (const q of vectors) lists.push(topK(mine, 40, ([, v]) => cosine(q, v)).map((r) => r.v[0]));
     }
-    for (const q of queries) lists.push(this.keyword(q, 40));
+    for (const q of queries) lists.push(this.keyword(q, 40, allowed));
     const fused = reciprocalRank(lists);
 
     const exclude = new Set(params.exclude ?? []);
     const lineWords = wordSet(params.line);
     const taste = new Map<string, number>();
-    for (const c of this.db.all<{ line: string; shot_id: string; accepted: number }>("SELECT line, shot_id, accepted FROM choices ORDER BY id DESC LIMIT 500")) {
+    // Taste belongs to the person editing, even when the footage comes from a colleague's library.
+    for (const c of this.db.all<{ line: string; shot_id: string; accepted: number }>("SELECT line, shot_id, accepted FROM choices WHERE member_id = ? ORDER BY id DESC LIMIT 500", viewerId)) {
       const sim = jaccard(lineWords, wordSet(c.line));
       if (sim >= 0.34) taste.set(c.shot_id, (taste.get(c.shot_id) ?? 0) + (c.accepted ? 0.02 : -0.03) * sim * 3);
     }
 
-    const rows = [...fused.keys()].filter((id) => !exclude.has(id)).map((id) => this.db.get<ShotRow & { collection: string; name: string; file_hash: string }>("SELECT s.*, c.collection, c.name, c.file_hash FROM shots s JOIN clips c ON c.id = s.clip_id WHERE s.id = ?", id)).filter((r): r is NonNullable<typeof r> => !!r);
+    const rows = [...fused.keys()].filter((id) => !exclude.has(id) && !exclude.has(allowed.get(id) ?? id)).map((id) => this.db.get<ShotRow & { collection: string; name: string; file_hash: string }>("SELECT s.*, c.collection, c.name, c.file_hash FROM shots s JOIN clips c ON c.id = s.clip_id WHERE s.id = ?", id)).filter((r): r is NonNullable<typeof r> => !!r);
     const passes = rows.filter((r) => {
       const f = json<{ seconds?: number; vertical?: boolean; motion?: number }>(r.facts, {});
       if (params.collection && r.collection !== params.collection) return false;
@@ -356,6 +565,12 @@ export class Library {
       if (params.minSeconds && (f.seconds ?? 0) < params.minSeconds) return false;
       if (params.energy === "calm" && (f.motion ?? 0) > 0.03) return false;
       if (params.energy === "lively" && (f.motion ?? 0) < 0.012) return false;
+      // Shots from before roles existed have none, so they still show up.
+      if (params.role || params.layout) {
+        const card = json<Partial<Card>>(r.card ?? (r.duplicate_of ? this.db.get<{ card: string | null }>("SELECT card FROM shots WHERE id = ?", r.duplicate_of)?.card ?? null : null), {});
+        if (params.role && card.role && card.role !== params.role) return false;
+        if (params.layout && card.layouts?.length && !card.layouts.includes(params.layout)) return false;
+      }
       return true;
     });
     const score = (r: ShotRow) => (fused.get(r.id) ?? 0) + (taste.get(r.id) ?? 0) - Math.min(0.01, r.uses * 0.002);
@@ -365,19 +580,28 @@ export class Library {
       const y = this.prints.get(b.id);
       return x && y && x.length === y.length ? Math.max(0, cosine(x, y)) * 0.03 : 0;
     }, limit);
-    return best.map((r) => this.cardView(r));
+    // A near-copy the person can see stands in for an original they can't.
+    return best.map((r) => ({ ...this.cardView(r), id: allowed.get(r.id) ?? r.id, library: this.libraryNameFor(viewerId, allowed.get(r.id) ?? r.id) }));
+  }
+
+  private libraryNameFor(viewerId: string, shotId: string) {
+    const libs = this.visibleLibraries(viewerId);
+    if (!libs.length) return null;
+    return this.db.get<{ name: string }>(`SELECT l.name FROM shots s JOIN library_clips lc ON lc.clip_id = s.clip_id JOIN libraries l ON l.id = lc.library_id WHERE s.id = ? AND l.id IN (${libs.map(() => "?").join(",")}) ORDER BY l.owner_id = ? DESC LIMIT 1`, shotId, ...libs, viewerId)?.name ?? null;
   }
 
   private cardView(r: ShotRow) {
     const card = json<Card | null>(r.card, null);
     const f = json<{ seconds?: number; motion?: number; palette?: { color: string }[]; faces?: number }>(r.facts, {});
-    return { id: r.id, seconds: f.seconds, summary: card?.summary ?? "", implies: card?.meanings ?? [], mood: card?.mood ?? [], faces: f.faces ?? 0, colors: f.palette?.slice(0, 3).map((p) => p.color) ?? [], category: r.tree };
+    return { id: r.id, seconds: f.seconds, summary: card?.summary ?? "", implies: card?.meanings ?? [], mood: card?.mood ?? [], role: card?.role ?? null, layouts: card?.layouts ?? [], faces: f.faces ?? 0, colors: f.palette?.slice(0, 3).map((p) => p.color) ?? [], category: r.tree };
   }
 
+  /** A shot's file and analysis. A near-copy borrows the original's card. Callers check access first. */
   shot(id: string) {
     const r = this.db.get<ShotRow & { name: string; file_hash: string }>("SELECT s.*, c.name, c.file_hash FROM shots s JOIN clips c ON c.id = s.clip_id WHERE s.id = ?", id);
     if (!r) throw new Error(`No shot with id ${id}.`);
-    return { ...r, path: this.files.get(r.file_hash).path, card: json<Card | null>(r.card, null), facts: json<Record<string, unknown>>(r.facts, {}) };
+    const card = r.card ?? (r.duplicate_of ? this.db.get<{ card: string | null }>("SELECT card FROM shots WHERE id = ?", r.duplicate_of)?.card ?? null : null);
+    return { ...r, path: this.files.get(r.file_hash).path, card: json<Card | null>(card, null), facts: json<Record<string, unknown>>(r.facts, {}) };
   }
 
   filmstripData(id: string) {
@@ -387,17 +611,21 @@ export class Library {
   }
 
   /** Local visual similarity from Apple Vision feature prints. Needs no API key. */
-  similar(id: string, limit = 8) {
+  similar(viewerId: string, id: string, limit = 8) {
     this.load();
-    const q = this.prints.get(id);
+    this.mustSeeShot(viewerId, id);
+    const allowed = this.visibleShots(viewerId);
+    const self = this.db.get<{ duplicate_of: string | null }>("SELECT duplicate_of FROM shots WHERE id = ?", id)?.duplicate_of ?? id;
+    const q = this.prints.get(self);
     if (!q) throw new Error("That shot has no visual print yet.");
-    return topK([...this.prints.entries()].filter(([k, v]) => k !== id && v.length === q.length), limit, ([, v]) => cosine(q, v)).map((r) => ({ ...this.cardView(this.db.get<ShotRow>("SELECT * FROM shots WHERE id = ?", r.v[0])!), similarity: Number(r.s.toFixed(3)) }));
+    return topK([...this.prints.entries()].filter(([k, v]) => k !== self && allowed.has(k) && v.length === q.length), limit, ([, v]) => cosine(q, v)).map((r) => ({ ...this.cardView(this.db.get<ShotRow>("SELECT * FROM shots WHERE id = ?", r.v[0])!), id: allowed.get(r.v[0])!, similarity: Number(r.s.toFixed(3)) }));
   }
 
   /** The tree is derived from cards. Merging similar names never touches any embedding. */
-  tree(prefix = "") {
+  tree(viewerId: string, prefix = "") {
     const counts = new Map<string, number>();
-    const rows = this.db.all<{ tree: string }>("SELECT tree FROM shots WHERE tree IS NOT NULL AND duplicate_of IS NULL");
+    const allowed = this.visibleShots(viewerId);
+    const rows = this.db.all<{ id: string; tree: string }>("SELECT id, tree FROM shots WHERE tree IS NOT NULL AND duplicate_of IS NULL").filter((r) => allowed.has(r.id));
     const names = new Set(rows.flatMap((r) => r.tree.split(" / ")));
     const u = new UnionFind();
     const list = [...names];
@@ -419,22 +647,25 @@ export class Library {
     return [...counts.entries()].filter(([k]) => k.split(" / ").length === depth && (!prefix || k.startsWith(`${prefix} / `))).map(([path, count]) => ({ path, count })).sort((a, b) => b.count - a.count);
   }
 
-  browse(path: string, limit = 12) {
-    return this.db.all<ShotRow>("SELECT * FROM shots WHERE tree LIKE ? AND duplicate_of IS NULL LIMIT ?", `${path}%`, limit).map((r) => this.cardView(r));
+  browse(viewerId: string, path: string, limit = 12) {
+    const allowed = this.visibleShots(viewerId);
+    return this.db.all<ShotRow>("SELECT * FROM shots WHERE tree LIKE ? AND duplicate_of IS NULL", `${path}%`).filter((r) => allowed.has(r.id)).slice(0, limit).map((r) => ({ ...this.cardView(r), id: allowed.get(r.id)! }));
   }
 
-  logChoice(line: string, shotId: string, accepted: boolean, chatId: string | null) {
-    this.db.run("INSERT INTO choices (line, shot_id, accepted, chat_id, created_at) VALUES (?, ?, ?, ?, ?)", line, shotId, accepted ? 1 : 0, chatId, Date.now());
-    if (accepted) this.db.run("UPDATE shots SET uses = uses + 1 WHERE id = ?", shotId);
+  /** Taste is per person. Ranking learns from each pick, scored against the original shot. */
+  logChoice(memberId: string, line: string, shotId: string, accepted: boolean, chatId: string | null) {
+    const canonical = this.db.get<{ duplicate_of: string | null }>("SELECT duplicate_of FROM shots WHERE id = ?", shotId)?.duplicate_of ?? shotId;
+    this.db.run("INSERT INTO choices (line, shot_id, accepted, chat_id, created_at, member_id) VALUES (?, ?, ?, ?, ?, ?)", line, canonical, accepted ? 1 : 0, chatId, Date.now(), memberId);
+    if (accepted) this.db.run("UPDATE shots SET uses = uses + 1 WHERE id = ?", canonical);
   }
 
-  /** Lists searches that came back weak, so users know what footage to shoot next. */
-  recordGap(line: string) {
-    this.db.run("INSERT INTO usage_notes (kind, amount, units, created_at) VALUES (?, 0, 0, ?)", `gap:${line.slice(0, 120)}`, Date.now());
+  /** Lists searches that came back weak, so people know what footage to shoot next. */
+  recordGap(memberId: string, line: string) {
+    this.db.run("INSERT INTO usage_notes (kind, amount, units, created_at, member_id) VALUES (?, 0, 0, ?, ?)", `gap:${line.slice(0, 120)}`, Date.now(), memberId);
   }
 
-  gaps() {
-    return this.db.all<{ kind: string }>("SELECT kind FROM usage_notes WHERE kind LIKE 'gap:%' ORDER BY id DESC LIMIT 30").map((r) => r.kind.slice(4));
+  gaps(memberId: string) {
+    return this.db.all<{ kind: string }>("SELECT kind FROM usage_notes WHERE kind LIKE 'gap:%' AND member_id = ? ORDER BY id DESC LIMIT 30", memberId).map((r) => r.kind.slice(4));
   }
 }
 
