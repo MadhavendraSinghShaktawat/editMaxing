@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { Brain, Check, LogOut, Square, TriangleAlert, X } from "lucide-react";
+import { Brain, Check, LogOut, Play, Square, TriangleAlert, X } from "lucide-react";
 import { STAGES, STARTERS } from "../sim/data";
 import { api } from "../sim/engine";
 import { Attachment, Decision, Editor, Message, stateLabel, store, useStore } from "../sim/store";
 import { AttachButton, AttachmentStrip, formatSize, formatTime, useAttachments } from "./Attach";
+import { CompactChip, ContextCompactionRow, ContextWindowMeter, shouldOfferResumeCompaction } from "./Context";
 import { DecisionCards } from "./Decisions";
 import { Icon } from "./Icon";
 import { ModelPicker } from "./ModelPicker";
@@ -92,6 +93,30 @@ function Rich({ text }: { text: string }) {
   );
 }
 
+/**
+ * The newest cut, pinned under the header, so it's always one tap away however long the chat
+ * gets. It opens into a player here, and into the full review with versions and comments.
+ */
+function LatestCut({ e, onReview }: { e: Editor; onReview: () => void }) {
+  const [open, setOpen] = useState(false);
+  const latest = [...e.messages].reverse().find((m) => m.video);
+  const count = e.messages.filter((m) => m.video).length;
+  useEffect(() => setOpen(false), [latest?.id]);
+  if (!latest?.video) return null;
+  return (
+    <div className={`latest-cut ${open ? "is-open" : ""}`}>
+      {open && <video key={latest.video.url} src={latest.video.url} controls autoPlay playsInline />}
+      <div className="latest-cut-bar">
+        <button type="button" className="latest-cut-play" onClick={() => setOpen(!open)} aria-expanded={open}>
+          {open ? <X size={14} /> : <Play size={14} fill="currentColor" />}
+          <span><b>{latest.text}</b>{count > 1 && <small>{count} versions</small>}</span>
+        </button>
+        <button type="button" className="latest-cut-review" onClick={onReview}>Review</button>
+      </div>
+    </div>
+  );
+}
+
 function RenderCard({ m }: { m: Message }) {
   const v = m.video!;
   const failed = v.quality?.checks.filter((c) => !c.ok) ?? [];
@@ -138,6 +163,7 @@ function MemoryCard({ m }: { m: Message & { memory: NonNullable<Message["memory"
 function Bubble({ m, editor }: { m: Message; editor: Editor }) {
   if (m.memory) return <MemoryCard m={m as Message & { memory: NonNullable<Message["memory"]> }} />;
   if (m.video) return <RenderCard m={m} />;
+  if (m.compaction) return <ContextCompactionRow m={m as Message & { compaction: NonNullable<Message["compaction"]> }} />;
   if (m.error) return <div className="msg-system bad">{m.text}</div>;
   if (m.from === "system") return <div className="msg-system">{m.text}</div>;
   if (m.tool) {
@@ -145,6 +171,7 @@ function Bubble({ m, editor }: { m: Message; editor: Editor }) {
       <div className="msg-tool">
         <Icon name={STAGES.find((s) => s.label === m.tool)?.icon ?? "gear"} size={13} />
         {m.text}
+        {m.childId && store.editors.some((x) => x.id === m.childId) && <button type="button" className="msg-tool-link" onClick={() => store.select(m.childId!)}>Watch</button>}
       </div>
     );
   }
@@ -163,6 +190,7 @@ export function ChatPanel({ onReview, onVideo }: { onReview: (id: string) => voi
   const [draft, setDraft] = useState("");
   const [dropping, setDropping] = useState(false);
   const [ending, setEnding] = useState(false);
+  const [keepFullHistory, setKeepFullHistory] = useState(false);
   const files = useAttachments(e?.mission ? "reference" : "footage");
   const scroll = useRef<HTMLDivElement>(null);
   const count = (e?.messages.length ?? 0) + (e?.questions.length ?? 0) + (e?.draft.length ?? 0);
@@ -187,12 +215,27 @@ export function ChatPanel({ onReview, onVideo }: { onReview: (id: string) => voi
   const stage = STAGES[e.stage];
   const ready = e.mission && stage.id === "review";
   const busy = e.status === "working" || e.status === "thinking";
+  // An agent another chat started shows its work here, but takes directions only from that chat.
+  const readOnly = !!e.parentId;
+  const parent = e.parentId ? s.editors.find((x) => x.id === e.parentId) ?? null : null;
 
   const canSend = (draft.trim() || files.items.length) && !files.busy;
+  // A large chat back after Claude's cache expired offers to compact first; the chip switches to Keep.
+  const account = s.accounts.find((a) => a.id === e.accountId);
+  const offerCompact = s.live && !busy && shouldOfferResumeCompaction(e.context, account?.kind);
+  const compactsBeforeSend = offerCompact && !keepFullHistory;
+  const modelName = account?.models.find((m) => m.id === e.model)?.name ?? e.model;
   const send = () => {
     if (!canSend) return;
-    store.send(e.id, draft, files.ready());
+    // "/compact" typed into the box runs Claude Code's own compact command.
+    if (/^\/compact\b/.test(draft.trim()) && !files.items.length) {
+      void store.attempt(() => api("POST", `/api/chats/${e.id}/compact`));
+      setDraft("");
+      return;
+    }
+    store.send(e.id, draft, files.ready(), { compactFirst: compactsBeforeSend });
     setDraft("");
+    setKeepFullHistory(false);
     files.clear();
   };
 
@@ -202,7 +245,7 @@ export function ChatPanel({ onReview, onVideo }: { onReview: (id: string) => voi
       aria-label={`Chat with ${e.name}`}
       onDragOver={(ev) => {
         ev.preventDefault();
-        setDropping(true);
+        if (!readOnly) setDropping(true);
       }}
       onDragLeave={(ev) => {
         if (!ev.currentTarget.contains(ev.relatedTarget as Node)) setDropping(false);
@@ -210,7 +253,7 @@ export function ChatPanel({ onReview, onVideo }: { onReview: (id: string) => voi
       onDrop={(ev) => {
         ev.preventDefault();
         setDropping(false);
-        void files.add(ev.dataTransfer.files);
+        if (!readOnly) void files.add(ev.dataTransfer.files);
       }}
     >
       <div className="chat-frame sheet">
@@ -232,7 +275,7 @@ export function ChatPanel({ onReview, onVideo }: { onReview: (id: string) => voi
             </label>
             <span className={`state ${e.activity}`}>{stateLabel[e.activity]}</span>
           </div>
-          {ending ? (
+          {readOnly ? null : ending ? (
             <button className="end-confirm" onClick={() => s.endChat(e.id)} onBlur={() => setEnding(false)} autoFocus>
               End chat?
             </button>
@@ -255,6 +298,15 @@ export function ChatPanel({ onReview, onVideo }: { onReview: (id: string) => voi
             </div>
           </div>
         )}
+
+        {parent && (
+          <div className="spawned-by">
+            <span>Started by <b>{parent.name}</b> · watch only</span>
+            <button type="button" onClick={() => s.select(parent.id)}>Open {parent.name}</button>
+          </div>
+        )}
+
+        {!readOnly && <LatestCut e={e} onReview={() => onReview(e.id)} />}
 
         <div className="chat-body" ref={scroll}>
           {e.messages.length === 0 && (
@@ -284,7 +336,7 @@ export function ChatPanel({ onReview, onVideo }: { onReview: (id: string) => voi
           </button>
         )}
 
-        <form
+        {!readOnly && <form
           className="composer"
           onSubmit={(ev) => {
             ev.preventDefault();
@@ -326,11 +378,21 @@ export function ChatPanel({ onReview, onVideo }: { onReview: (id: string) => voi
                 <Square size={13} fill="currentColor" />
               </button>
             )}
-            <button type="submit" className="send" disabled={!canSend}>
-              {files.items.some((f) => f.progress < 1) ? "Adding…" : "Send"}
+            {s.live && e.context && (
+              <ContextWindowMeter
+                usage={e.context}
+                modelDisplayName={modelName}
+                onCompact={() => void store.attempt(() => api("POST", `/api/chats/${e.id}/compact`))}
+                compactDisabled={busy}
+                compactDisabledReason={busy ? `Available when ${e.name} finishes this turn.` : null}
+              />
+            )}
+            {offerCompact && e.context && <CompactChip tokens={e.context.usedTokens} keep={keepFullHistory} onToggle={() => setKeepFullHistory(!keepFullHistory)} />}
+            <button type="submit" className="send" disabled={!canSend} title={compactsBeforeSend && e.context ? `Summarize ${e.context.usedTokens.toLocaleString("en-US")} tokens of history, then send` : undefined}>
+              {files.items.some((f) => f.progress < 1) ? "Adding…" : compactsBeforeSend ? "Compact and send" : "Send"}
             </button>
           </div>
-        </form>
+        </form>}
       </div>
     </aside>
   );

@@ -2185,3 +2185,65 @@ button.card { text-align: left; font: inherit; color: inherit; cursor: pointer; 
 .auth-card .primary { margin-top: 8px; }
 .settings-shell { min-height: min(640px, 70vh); }
 .memory-add > .why:first-child, .invite-link > .why:first-child { flex: 3 1 280px; }
+
+/* ── Latest cut, pinned in the chat ─────────────────────────── */
+.latest-cut { margin: 0 12px 8px; overflow: hidden; border-radius: 14px; background: var(--surface, #1b1c20); box-shadow: inset 0 0 0 1px var(--line); }
+.latest-cut video { display: block; width: 100%; max-height: 46vh; background: #000; }
+.latest-cut-bar { display: flex; align-items: center; gap: 6px; padding: 6px; }
+.latest-cut-play { display: flex; flex: 1; align-items: center; gap: 10px; min-width: 0; padding: 6px 8px; border: 0; border-radius: 10px; background: transparent; color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.latest-cut-play:hover { background: var(--well, rgba(127,127,127,.12)); }
+.latest-cut-play > svg { flex: none; width: 28px; height: 28px; padding: 7px; border-radius: 50%; background: var(--accent, #2563eb); color: #fff; }
+.latest-cut-play span { display: grid; min-width: 0; }
+.latest-cut-play b { overflow: hidden; font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.latest-cut-play small { color: var(--text-3, #888); font-size: 11.5px; }
+.latest-cut-review { flex: none; padding: 7px 12px; border: 0; border-radius: 10px; background: var(--well, rgba(127,127,127,.14)); color: var(--text); font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+
+/* ── Approvals ──────────────────────────────────────────────── */
+.decision.perm .perm-action { margin: 2px 0 0; font-size: 14px; font-weight: 600; line-height: 1.4; }
+.decision.perm .perm-why { display: block; margin-top: 4px; color: var(--text-3, #888); font-size: 12px; }
+.perm-list { display: grid; gap: 6px; margin-top: 10px; }
+.perm-list > small { color: var(--text-3, #888); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+.perm-url { display: grid; gap: 4px; }
+.perm-url a { font-size: 13px; font-weight: 600; }
+.perm-list code, .perm-url code { overflow: hidden; color: var(--text-2, #aaa); font-size: 11.5px; text-overflow: ellipsis; white-space: nowrap; }
+.perm-media { width: 100%; max-height: 180px; margin-top: 4px; border-radius: 8px; background: #000; object-fit: contain; }
+.perm-command { margin-top: 10px; }
+.perm-command summary { color: var(--text-2, #aaa); font-size: 12px; cursor: pointer; }
+.perm-command pre { max-height: 180px; margin: 6px 0 0; padding: 10px; overflow: auto; border-radius: 8px; background: var(--well, rgba(127,127,127,.12)); font-size: 11px; line-height: 1.45; white-space: pre-wrap; word-break: break-all; }
+
+/* ── Context window and compaction (as in T3 Code) ──────────── */
+.ctx-meter { position: relative; display: inline-flex; }
+.ctx-meter-ring { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 8px; background: transparent; cursor: pointer; }
+.ctx-meter-ring:hover, .ctx-meter-ring[aria-expanded="true"] { background: var(--well, rgba(127,127,127,.14)); }
+.ctx-meter-ring svg { width: 20px; height: 20px; transform: rotate(-90deg); }
+.ctx-meter-ring .track { stroke: color-mix(in oklab, var(--text-2, #999) 24%, transparent); }
+.ctx-meter-ring .value { transition: stroke-dashoffset .5s ease-out, stroke .5s ease-out; }
+.ctx-meter-pop { position: absolute; right: 0; bottom: calc(100% + 8px); z-index: 40; display: grid; gap: 8px; width: 240px; padding: 12px; border-radius: 12px; background: var(--surface-2, #1d1e22); box-shadow: 0 10px 30px rgba(0,0,0,.3), inset 0 0 0 1px var(--line); text-align: left; }
+.ctx-meter-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text-2, #aaa); font-size: 12px; font-weight: 600; }
+.ctx-meter-head .num { color: var(--text-3, #888); font-size: 11px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.ctx-meter-head .num i { margin: 0 4px; font-style: normal; }
+.ctx-meter-bar { height: 6px; overflow: hidden; border-radius: 999px; background: color-mix(in oklab, var(--text-2, #999) 18%, transparent); }
+.ctx-meter-bar i { display: block; height: 100%; border-radius: 999px; transition: width .5s ease-out; }
+.ctx-meter-pop p { margin: 0; color: var(--text-3, #888); font-size: 11px; font-weight: 500; line-height: 1.45; }
+.ctx-meter-compact { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--text); font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
+.ctx-meter-compact:disabled { cursor: default; opacity: .5; }
+.ctx-row { display: flex; align-items: center; gap: 10px; padding: 4px 2px; color: var(--text-3, #888); font-size: 12px; }
+.ctx-row .line { flex: 1; height: 1px; background: var(--line); }
+.ctx-row.bad { color: var(--bad, #e5484d); }
+.ctx-row.bad .line { background: color-mix(in oklab, var(--bad, #e5484d) 30%, transparent); }
+.ctx-row-text { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.ctx-row-text .why { overflow: hidden; opacity: .8; text-overflow: ellipsis; white-space: nowrap; }
+.ctx-row.active .ctx-row-text { background: linear-gradient(90deg, currentColor 40%, var(--text) 50%, currentColor 60%) 0 0 / 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: ctx-shimmer 1.6s linear infinite; }
+.ctx-row.active .ctx-row-text svg { color: var(--text-3, #888); }
+@keyframes ctx-shimmer { to { background-position: -200% 0; } }
+.ctx-chip { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 8px; border: 0; border-radius: 8px; background: transparent; color: color-mix(in oklab, var(--text) 80%, transparent); font: inherit; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; cursor: pointer; }
+.ctx-chip[aria-pressed="true"] { background: var(--well, rgba(127,127,127,.14)); color: var(--text); }
+.ctx-chip svg { color: var(--text-3, #888); }
+.ctx-chip .n { color: var(--text-3, #888); }
+.decision.perm .perm-foot { display: block; margin-top: 8px; color: var(--text-3, #888); font-size: 11.5px; line-height: 1.4; }
+
+/* ── A spawned agent's chat: watch only ─────────────────────── */
+.spawned-by { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 12px 8px; padding: 8px 8px 8px 12px; border-radius: 12px; background: var(--well, rgba(127,127,127,.12)); color: var(--text-2, #aaa); font-size: 12.5px; box-shadow: inset 0 0 0 1px var(--line); }
+.spawned-by b { color: var(--text); font-weight: 600; }
+.spawned-by button { flex: none; padding: 6px 10px; border: 0; border-radius: 8px; background: var(--surface, rgba(255,255,255,.06)); color: var(--text); font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
+.msg-tool-link { margin-left: auto; padding: 2px 8px; border: 0; border-radius: 6px; background: var(--well, rgba(127,127,127,.14)); color: var(--text); font: inherit; font-size: 11.5px; font-weight: 600; cursor: pointer; }

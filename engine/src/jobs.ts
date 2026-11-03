@@ -8,7 +8,8 @@ import { Heap } from "./lib/dsa.ts";
  * Heavy work runs one job at a time per Mac, so renders never fight each other.
  * The "claude" lane keeps background analysis from competing with live chats.
  */
-const LANES = { heavy: 1, light: 3, claude: 1 } as const;
+/** Downloads get their own lane, so a 4 GB folder never holds up transcription or a render. */
+const LANES = { heavy: 1, light: 3, claude: 1, net: 2 } as const;
 export type Lane = keyof typeof LANES;
 
 export type JobContext = {
@@ -52,6 +53,10 @@ export class Jobs {
 
   /** Requeues work that was interrupted by a restart. Only resumable kinds are retried. */
   resume(kinds: string[]) {
+    // Work someone was waiting on, like a render inside a turn, can't report back after a restart.
+    // It's closed, so it never shows as running forever; the resumed turn starts it again.
+    const stale = this.db.all<{ id: string }>(`SELECT id FROM jobs WHERE status IN ('queued', 'running') AND kind NOT IN (${kinds.map(() => "?").join(",") || "''"})`, ...kinds);
+    for (const j of stale) this.db.run("UPDATE jobs SET status = 'cancelled', error = 'Shifu Dojo restarted before this finished.', updated_at = ? WHERE id = ?", Date.now(), j.id);
     const rows = this.db.all<{ id: string; kind: string; resource: Lane; priority: number; payload: string; owner_id: string | null }>("SELECT id, kind, resource, priority, payload, owner_id FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at");
     for (const r of rows) {
       if (kinds.includes(r.kind)) this.enqueue({ id: r.id, kind: r.kind, lane: r.resource, priority: r.priority, order: this.order++, payload: json(r.payload, {}), owner: r.owner_id });

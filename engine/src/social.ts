@@ -1,14 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { createWriteStream, rmSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 import { isIP } from "node:net";
 import { join } from "node:path";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
-import type { ReadableStream as WebStream } from "node:stream/web";
 import { DIRS, findBin } from "./config.ts";
 import type { Files } from "./files.ts";
 import { HttpError } from "./lib/http.ts";
 import { probe } from "./lib/media.ts";
+import { dropPart, readMeta, resumable } from "./lib/download.ts";
 import { run } from "./lib/proc.ts";
 
 /**
@@ -155,15 +153,14 @@ export function safeMediaUrl(raw: string) {
 
 // ── Talking to Scrape Creators ─────────────────────────────────
 
-const MAX_BYTES = 4 * 1024 ** 3;
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
 
 async function call(key: string, path: string, params: Record<string, string>, fetcher: typeof fetch, signal?: AbortSignal) {
   const res = await fetcher(`${SCRAPE_API}${path}?${new URLSearchParams(params)}`, { headers: { "x-api-key": key }, signal: signal ?? AbortSignal.timeout(90_000) });
   const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-  if (res.status === 401 || res.status === 403) throw new HttpError(400, "Scrape Creators didn't accept your API key. Check it in Settings → My account.");
+  if (res.status === 401 || res.status === 403) throw new HttpError(400, "Scrape Creators didn't accept your API key. Check it in Settings → Account.");
   if (res.status === 402) throw new HttpError(402, "Your Scrape Creators account is out of credits.");
-  if (res.status === 404) throw new HttpError(404, "Scrape Creators couldn't find that post. It may be private, deleted or blocked in its region.");
+  if (res.status === 404) throw new HttpError(404, path.startsWith("/v1/account") ? "Scrape Creators didn't answer the account check. Try again in a minute." : "Scrape Creators couldn't find that post. It may be private, deleted or blocked in its region.");
   if (res.status === 429) throw new HttpError(429, "Scrape Creators is rate limiting this key. Try again in a minute.");
   if (!res.ok || !body) throw new HttpError(502, `Scrape Creators couldn't read that link${body?.message ? `: ${String(body.message).slice(0, 200)}` : "."}`);
   return body;
@@ -171,40 +168,102 @@ async function call(key: string, path: string, params: Record<string, string>, f
 
 /** Checks a key and returns its credit balance. Costs nothing. */
 export async function creditBalance(key: string, fetcher: typeof fetch = fetch) {
-  const r = await call(key, "/v1/account/credit_balance", {}, fetcher);
-  return Number(r.creditCount ?? r.credits ?? 0);
+  const r = await call(key, "/v1/account/credit-balance", {}, fetcher);
+  return Number(r.credits_remaining ?? r.creditCount ?? 0);
 }
 
-async function download(url: string, out: string, fetcher: typeof fetch, signal?: AbortSignal) {
-  if (!safeMediaUrl(url)) throw new Error("not a public https file");
-  if (/\.m3u8(\?|$)/i.test(url)) {
-    // A stream is stitched into one file by ffmpeg, which also joins its sound.
-    await run(findBin("ffmpeg")!, ["-y", "-loglevel", "error", "-user_agent", UA, "-protocol_whitelist", "https,tls,tcp,crypto", "-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", out], { signal });
-    return;
+// ── HLS streams ────────────────────────────────────────────────
+
+/** A master playlist's best video variant and its separate audio, if it names them. */
+export function hlsVariants(text: string, base: string) {
+  const lines = text.split(/\r?\n/).map((l) => l.trim());
+  let best: { url: string; bandwidth: number; audio: string | null } | null = null;
+  const audio = new Map<string, string>();
+  for (const l of lines) {
+    if (!l.startsWith("#EXT-X-MEDIA:") || !/TYPE=AUDIO/.test(l)) continue;
+    const group = l.match(/GROUP-ID="([^"]+)"/)?.[1];
+    const uri = l.match(/URI="([^"]+)"/)?.[1];
+    if (group && uri && !audio.has(group)) audio.set(group, new URL(uri, base).toString());
   }
-  // Redirects are followed by hand, so every hop is checked before it's fetched.
-  let res: Response | null = null;
-  let next = url;
-  for (let hop = 0; hop < 6; hop++) {
-    if (!safeMediaUrl(next)) throw new Error("the video host redirected somewhere private");
-    res = await fetcher(next, { headers: { "User-Agent": UA, Accept: "video/*,*/*;q=0.8" }, redirect: "manual", signal: signal ?? AbortSignal.timeout(600_000) });
-    const to = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
-    if (!to) break;
-    next = new URL(to, next).toString();
-    res = null;
-  }
-  if (!res) throw new Error("the video host redirected too many times");
-  if (!res.ok || !res.body) throw new Error(`the video host answered ${res.status}`);
-  const type = res.headers.get("content-type") ?? "";
-  if (/text\/html|application\/json/i.test(type)) throw new Error("the video host sent a page instead of a video");
-  if (Number(res.headers.get("content-length") ?? 0) > MAX_BYTES) throw new Error("the video is over 4 GB");
-  let size = 0;
-  const stream = Readable.fromWeb(res.body as unknown as WebStream<Uint8Array>);
-  stream.on("data", (c: Buffer) => {
-    size += c.length;
-    if (size > MAX_BYTES) stream.destroy(new Error("the video is over 4 GB"));
+  lines.forEach((l, i) => {
+    if (!l.startsWith("#EXT-X-STREAM-INF:")) return;
+    const uri = lines.slice(i + 1).find((x) => x && !x.startsWith("#"));
+    if (!uri) return;
+    const bandwidth = Number(l.match(/[:,]BANDWIDTH=(\d+)/)?.[1] ?? 0);
+    const group = l.match(/AUDIO="([^"]+)"/)?.[1];
+    if (!best || bandwidth > best.bandwidth) best = { url: new URL(uri, base).toString(), bandwidth, audio: group ? audio.get(group) ?? null : null };
   });
-  await pipeline(stream, createWriteStream(out));
+  return best as { url: string; bandwidth: number; audio: string | null } | null;
+}
+
+/**
+ * A media playlist's total length, and the one file behind it when every segment is a byte range
+ * of the same file (Pinterest serves CMAF this way). ffmpeg reads only the first segment of those,
+ * so the whole file is fetched directly instead.
+ */
+export function hlsMedia(text: string, base: string) {
+  const lines = text.split(/\r?\n/).map((l) => l.trim());
+  const seconds = lines.filter((l) => l.startsWith("#EXTINF:")).reduce((s, l) => s + (Number.parseFloat(l.slice(8)) || 0), 0);
+  const uris = new Set(lines.filter((l) => l && !l.startsWith("#")).map((l) => new URL(l, base).toString()));
+  const map = lines.find((l) => l.startsWith("#EXT-X-MAP:"))?.match(/URI="([^"]+)"/)?.[1];
+  if (map) uris.add(new URL(map, base).toString());
+  const ranged = lines.some((l) => l.startsWith("#EXT-X-BYTERANGE"));
+  return { seconds, file: ranged && uris.size === 1 ? [...uris][0] : null };
+}
+
+async function playlist(url: string, fetcher: typeof fetch, signal?: AbortSignal) {
+  if (!safeMediaUrl(url)) throw new Error("not a public https file");
+  const res = await fetcher(url, { headers: { "User-Agent": UA }, signal });
+  if (!res.ok) throw new Error(`the stream answered ${res.status}`);
+  return res.text();
+}
+
+/** Downloads a stream into one MP4 and checks that all of it arrived. */
+export async function downloadStream(url: string, out: string, fetcher: typeof fetch, signal?: AbortSignal, onProgress?: (done: number, total: number | null) => void) {
+  dropPart(out);
+  const ffmpeg = findBin("ffmpeg")!;
+  let media = { url, audio: null as string | null };
+  let expected = 0;
+  let whole: { video: string; audio: string | null } | null = null;
+  try {
+    const top = await playlist(url, fetcher, signal);
+    const variant = /#EXT-X-STREAM-INF/.test(top) ? hlsVariants(top, url) : null;
+    if (variant) media = { url: variant.url, audio: variant.audio };
+    const v = hlsMedia(variant ? await playlist(media.url, fetcher, signal) : top, media.url);
+    expected = v.seconds;
+    const a = media.audio ? hlsMedia(await playlist(media.audio, fetcher, signal), media.audio) : null;
+    if (v.file && (!media.audio || a?.file)) whole = { video: v.file, audio: a?.file ?? null };
+  } catch (e) {
+    if (signal?.aborted) throw e;
+    // An unreadable playlist still goes to ffmpeg, which reports its own error.
+  }
+  if (whole) {
+    const parts = [whole.video, whole.audio].filter((x): x is string => !!x).map((u) => ({ u, part: join(DIRS.tmp, `${randomUUID()}.part`) }));
+    try {
+      for (const p of parts) await resumable(p.u, p.part, { fetcher, signal, onProgress, allow: safeMediaUrl, headers: { "User-Agent": UA } });
+      await run(ffmpeg, ["-y", "-loglevel", "error", ...parts.flatMap((p) => ["-i", p.part]), ...parts.flatMap((_, i) => ["-map", `${i}`]), "-c", "copy", "-movflags", "+faststart", "-f", "mp4", out], { signal });
+    } finally {
+      for (const p of parts) dropPart(p.part);
+    }
+  } else {
+    await run(ffmpeg, ["-y", "-loglevel", "error", "-user_agent", UA, "-protocol_whitelist", "https,tls,tcp,crypto", "-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", "-f", "mp4", out], { signal });
+  }
+  // A stream that stopped early still makes a valid file, so its length is checked against the playlist.
+  if (expected > 3) {
+    const got = (await probe(out)).duration;
+    if (got < expected * 0.9) throw new Error(`only ${got.toFixed(1)} s of the ${expected.toFixed(1)} s stream came down`);
+  }
+}
+
+async function download(url: string, out: string, fetcher: typeof fetch, signal?: AbortSignal, onProgress?: (done: number, total: number | null) => void) {
+  if (!safeMediaUrl(url)) throw new Error("not a public https file");
+  // A stream is stitched into one file, with its sound. Streams can't resume.
+  if (/\.m3u8(\?|$)/i.test(url)) return downloadStream(url, out, fetcher, signal, onProgress);
+  await resumable(url, out, {
+    fetcher, signal, onProgress, allow: safeMediaUrl,
+    headers: { "User-Agent": UA, Accept: "video/*,*/*;q=0.8" },
+    accept: (res) => (/text\/html|application\/json/i.test(res.headers.get("content-type") ?? "") ? "the video host sent a page instead of a video" : null),
+  });
 }
 
 /**
@@ -212,23 +271,45 @@ async function download(url: string, out: string, fetcher: typeof fetch, signal?
  * one costs nothing. CDN copies are tried first (about 1 credit); if every one is refused and the
  * platform offers it, a permanent copy is requested once (about 10 credits).
  */
-export async function fetchSocialVideo(files: Files, key: string, link: string, opts: { fetcher?: typeof fetch; signal?: AbortSignal } = {}) {
+export async function fetchSocialVideo(files: Files, key: string, link: string, opts: { fetcher?: typeof fetch; signal?: AbortSignal; part?: string; onProgress?: (done: number, total: number | null) => void } = {}) {
   const fetcher = opts.fetcher ?? fetch;
   const { platform, url } = platformOf(link);
   let credits = 0;
+  const finish = async (result: string) => {
+    try {
+      const name = `${platform.id}-${new URL(url).pathname.split("/").filter(Boolean).pop()?.slice(0, 40) ?? "video"}.mp4`.replace(/[^\w.-]+/g, "-");
+      const stored = await files.fromPath(result, name);
+      return { file: stored, platform: platform.name, credits };
+    } finally {
+      dropPart(result);
+    }
+  };
+  // An interrupted download carries on from its saved address first, which costs no credit.
+  // Platform addresses expire, so if it no longer works the post is looked up again.
+  const saved = opts.part ? readMeta(opts.part)?.url : undefined;
+  if (opts.part && saved) {
+    try {
+      await download(saved, opts.part, fetcher, opts.signal, opts.onProgress);
+      if ((await probe(opts.part)).hasVideo) return await finish(opts.part);
+    } catch (e) {
+      if (opts.signal?.aborted) throw e;
+    }
+    dropPart(opts.part);
+  }
   const attempt = async (data: Record<string, unknown>) => {
     credits += Number(data.credits_charged ?? 0);
     const tried: string[] = [];
     for (const candidate of videoCandidates(data, platform.id).slice(0, 4)) {
-      const out = join(DIRS.tmp, `${randomUUID()}.mp4`);
+      const out = opts.part ?? join(DIRS.tmp, `${randomUUID()}.mp4`);
       try {
-        await download(candidate, out, fetcher, opts.signal);
+        await download(candidate, out, fetcher, opts.signal, opts.onProgress);
         const info = await probe(out);
         if (!info.hasVideo || statSync(out).size < 1024) throw new Error("the file has no video");
         return out;
       } catch (e) {
-        rmSync(out, { force: true });
+        // A stopped download keeps its bytes for next time; a refused one is cleared.
         if (opts.signal?.aborted) throw e;
+        dropPart(out);
         tried.push((e as Error).message);
       }
     }
@@ -239,11 +320,5 @@ export async function fetchSocialVideo(files: Files, key: string, link: string, 
   if (result instanceof Error && platform.permanent) result = await attempt(await call(key, platform.endpoint, { url, download_media: "true" }, fetcher, opts.signal));
   if (result === null) throw new HttpError(422, `This ${platform.name} post has no video Scrape Creators can download. It may be a photo or text post.`);
   if (result instanceof Error) throw new HttpError(502, `Scrape Creators found the video, but it couldn't be downloaded (${result.message}). Try again, or download it yourself and upload the file.`);
-  try {
-    const name = `${platform.id}-${new URL(url).pathname.split("/").filter(Boolean).pop()?.slice(0, 40) ?? "video"}.mp4`.replace(/[^\w.-]+/g, "-");
-    const stored = await files.fromPath(result, name);
-    return { file: stored, platform: platform.name, credits };
-  } finally {
-    rmSync(result, { force: true });
-  }
+  return finish(result);
 }

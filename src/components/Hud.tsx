@@ -161,7 +161,7 @@ export function Crew() {
       {s.editors.map((e) => (
         <CrewRow key={e.id} e={e} />
       ))}
-      {s.editors.length > 0 && s.editors.length < MAX_EDITORS && (
+      {s.editors.length > 0 && s.editors.filter((x) => !x.parentId).length < MAX_EDITORS && (
         <button className="crew-add glass" aria-label="New chat" title="New chat" onClick={() => s.newChat()}>
           <Plus size={20} />
         </button>
@@ -196,7 +196,7 @@ export function Dock({ onBoard, onVideo }: { onBoard: (b: BoardId) => void; onVi
   const queue = s.needsYou();
   return (
     <nav className="dock glass" aria-label="Studio">
-      <button className="mission-btn" disabled={s.editors.length >= MAX_EDITORS} onClick={onVideo}>
+      <button className="mission-btn" disabled={s.editors.filter((x) => !x.parentId).length >= MAX_EDITORS} onClick={onVideo}>
         <Plus size={17} strokeWidth={2.4} />
         New video
       </button>

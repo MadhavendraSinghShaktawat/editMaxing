@@ -267,6 +267,8 @@ export type HarvestInput = {
   styleId: string; styleName: string; owner: string; accountId: string; sourceHash: string; path: string; duration: number;
   sequences: { path: string; rows: { row: number; t0: number; t1: number; reason: string }[] }[];
   stills: number[]; notes: string; captions: Record<string, unknown> | undefined; signal: AbortSignal;
+  /** Off for the second and later videos of a blended style, so a style keeps one thumbnail. */
+  thumbnail?: boolean;
   progress?: (v: number, message: string) => void;
 };
 
@@ -508,7 +510,7 @@ export class MotionLibrary {
       const technique = this.resolveTechnique(a.technique, a.domain, a.techniqueDescription ?? "", p.owner);
       ids.push(await this.save(p, "animation", { name: a.name.slice(0, 80), summary: a.summary, operation: a.operation, technique, card: { ...a, technique }, t0: a.at.t0, t1: a.at.t1 }));
     }
-    const thumb = await this.save(p, "thumbnail", { name: `${p.styleName} thumbnail`, summary: value.thumbnail?.why ?? "", operation: null, technique: null, card: { why: value.thumbnail?.why ?? "", at: thumbnailAt }, t0: thumbnailAt, t1: thumbnailAt });
+    const thumb = p.thumbnail === false ? null : await this.save(p, "thumbnail", { name: `${p.styleName} thumbnail`, summary: value.thumbnail?.why ?? "", operation: null, technique: null, card: { why: value.thumbnail?.why ?? "", at: thumbnailAt }, t0: thumbnailAt, t1: thumbnailAt });
     let caption: string | null = null;
     if (p.captions && p.captions.present !== false) {
       const at = captionAt ?? thumbnailAt;
@@ -580,7 +582,8 @@ export class MotionLibrary {
    * keywords are fused, filters narrow the field, the chat's own style and the person's past
    * picks lift results, then each technique appears once so the options truly differ.
    */
-  async suggest(viewerId: string, q: { job: string; line?: string; operation?: string; domain?: string; technique?: string; layer?: string; styleId?: string | null; count?: number; exclude?: string[] }) {
+  async suggest(viewerId: string, q: { job: string; line?: string; operation?: string; domain?: string; technique?: string; layer?: string; styleId?: string | null; styleIds?: string[]; count?: number; exclude?: string[] }) {
+    const mine = new Set([...(q.styleIds ?? []), ...(q.styleId ? [q.styleId] : [])]);
     const count = Math.max(3, Math.min(5, q.count ?? 4));
     const pool = this.list(viewerId, { kind: "animation", operation: q.operation, domain: q.domain, technique: q.technique }).filter((v) => !q.exclude?.includes(v.id) && (!q.layer || v.layer === q.layer));
     if (!pool.length) return [];
@@ -608,7 +611,7 @@ export class MotionLibrary {
       const sim = shared / (words.size + other.size - shared || 1);
       taste.set(c.item_id, (taste.get(c.item_id) ?? 0) + (c.accepted ? 0.01 : -0.015) * (0.5 + sim));
     }
-    const score = (v: MotionView) => (fused.get(v.id) ?? 0) + (q.styleId && v.styleId === q.styleId ? 0.012 : 0) + (taste.get(v.id) ?? 0) + Math.min(0.006, v.uses * 0.001);
+    const score = (v: MotionView) => (fused.get(v.id) ?? 0) + (v.styleId && mine.has(v.styleId) ? 0.012 : 0) + (taste.get(v.id) ?? 0) + Math.min(0.006, v.uses * 0.001);
     const ranked = [...pool].sort((a, b) => score(b) - score(a)).map((v) => ({ ...v, technique: v.technique?.id ?? null, view: v }));
     return diverse(ranked, count).map(({ view: v }) => ({
       id: v.id, name: v.name, summary: v.summary, operation: v.operation?.label ?? null, technique: [v.domain?.label, v.technique?.label].filter(Boolean).join(" / "),

@@ -145,6 +145,40 @@ Status key: `[x]` built and tested on a real run, `[~]` built but not yet tested
 - [x] `read_clips` transcribes every clip on this Mac and returns timed lines; `assemble_story` checks every take against its clip and joins them, at the first clip's size and frame rate, into the main footage (tested with mixed sizes, frame rates and a silent clip)
 - [~] The editor choosing the best takes across many clips (needs a real multi-clip edit)
 
+## 14. Several references, drafts and downloads that resume
+- [x] New video takes several reference videos (files, Drive files and folders, social links), each optionally marked for editing, motion graphics, explainer graphics, captions or sound. The editor and the Motion agent use each for what it's marked for
+- [x] Fixed: a message could only carry 20 attachments, so a large Drive folder lost clips. Now up to 200
+- [~] Styles board learns one style from up to 5 videos; every rule cites which video it came from and is checked against that video (verification tested; needs a real multi-video run)
+- [x] Mix saved styles: pick which style each area comes from. No analysis; starts as a draft. Mixed styles find their parents' animations and caption preset
+- [x] New video and New style keep a draft in the engine per person, saved as you go, restored on open, cleared on start or Discard
+- [x] Pasted links download as background jobs in their own lane, keep going when the window closes, and resume from the last byte after a crash (tested live: the engine was killed at 18.7 MB of a 134 MB Drive clip and finished from there)
+- [x] A link already fetched returns its file at once; the same link pasted again joins the running download
+- [x] Dropped files are fingerprinted (name, size, date, first and last 4 MB) and skipped if that person uploaded them before
+
+## 15. Compact context (as in T3 Code)
+- [x] Context-window meter beside Send: a ring, and a popup with "Context Window", percent and tokens used of the window, the auto-compact line, and **Compact context** (disabled while the editor is working)
+- [x] `/compact` typed in the chat runs Claude Code's own compact
+- [x] Each compaction is a divider in the chat: "Compacting context", then "Context compacted 412k → 38k tokens", or "Context compaction failed"
+- [x] A chat over 200,000 tokens that comes back after Claude's prompt cache expired (about an hour on a subscription, 5 minutes with an API key) shows a **Compact** chip by Send; Send becomes **Compact and send**, and the chip switches to **Keep**
+- [x] The context reading comes from Claude Code after each turn and each compaction (checked on a real session: `/compact` emits compacting, success and the boundary with before and after tokens)
+- [ ] Not built: T3 Code's "Auto-compact after" setting and "Compact idle threads" (Before the cache expires / When you return / Never)
+
+## 16. Agents survive closing the app (as in T3 Code)
+- [~] The engine runs as a launchd login service (`com.socialshifu.dojo.engine`), not as the app's child, so closing the window, quitting or a crashed app never stops editors. launchd starts it at login and again after a crash; logs go to `~/Library/Logs/Shifu Dojo/engine.log` (compiles; needs a real install)
+- [~] After an update the app restarts an older engine, asking first when editors are working (needs a real install)
+- [~] Closing the window keeps the app in the menu bar: who's working, Open Studio, Open in Browser, Stop or Start the engine (compiles; needs a real install)
+- [x] After a restart, each cut-off turn continues by itself with T3 Code's "Continue where you left off…" message; Motion agent work that died is named so it's started again; the chat says "Shifu Dojo restarted and resumed this turn"
+- [x] A chat that restarts 3 times within 5 minutes stops continuing and waits for a message
+- [x] Awaited work a restart orphaned, like a render, is closed instead of showing as running forever
+- [x] Settings → This Mac shows the background engine and who's working, with Stop for the Owner
+
+## 17. Spawned agents get a watch-only chat
+- [x] When a chat starts an agent (the Motion agent today), it appears as its own chat and character, named "Motion agent", showing its words and every step live, with "Started by Kai · watch only" and Open Kai
+- [x] It can't be written to: no message box, and the engine refuses messages, compact, settings, stop, end and restore for it, pointing back to the starting chat. Its approvals still appear in the starting chat
+- [x] The starting chat's "The Motion agent started building" line has Watch, which opens it
+- [x] It shows Finished or Stopped when the agent ends; ending the starting chat ends it; after a restart it says it stopped
+- [x] Spawned agents don't take one of the 8 studio seats
+
 ## Rules for this build
 - Claude's own login flow only. No token handling, no shared logins, no rotation.
 - Every Claude call uses the unmodified `claude` binary.

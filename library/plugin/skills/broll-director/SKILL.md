@@ -36,6 +36,17 @@ In Autopilot, pick and move on, then record it with `log_call`. Call `ask_choice
 - `find_similar` finds other takes of a shot that nearly works.
 - If nothing fits, say so through `log_call`. A weak search is recorded so the user knows what to shoot. Don't force a bad clip.
 
+## When the library is empty or has nothing
+
+The raw clips are a B-roll library too. Before giving up on a line:
+
+1. Look through the takes the story didn't use, and the parts of used clips with no speech (`read_clips` shows the timing): establishing shots, walking, hands on a keyboard or phone, a screen, the room, reactions.
+2. Check the candidates with `view_frames` and pick by meaning, the same way as above.
+3. Place them with `add_broll` from `inputs/`, with a gentle `move` if the shot is static.
+4. Put the reference's B-roll type layout on top when the style has one.
+
+Never fill a B-roll gap with a motion graphic. If even the raw clips have nothing, keep the speaker, add a punch-in or type, and log what to shoot next time.
+
 ## Envato Elements
 
 When `envato` tools are connected and the library has nothing that fits, search Envato Elements with `search_stock_video` (or `search_video_templates` for a designed moment). Envato only searches. You can't download or place an Envato item.

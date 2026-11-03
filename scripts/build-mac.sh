@@ -22,6 +22,8 @@ lipo -thin arm64 "$(node -p process.execPath)" -output "$APP/Contents/MacOS/node
 cp -R dist "$APP/Contents/Resources/dist"
 mkdir -p "$APP/Contents/Resources/engine" "$APP/Contents/Resources/library"
 cp -R engine/src "$APP/Contents/Resources/engine/src"
+# Each build gets an id, so the app can tell when the background engine is an older build and restart it.
+echo "$VERSION-$(date +%Y%m%d%H%M%S)-$(git rev-parse --short HEAD 2>/dev/null || echo local)" > "$APP/Contents/Resources/BUILD"
 cp -R library/plugin "$APP/Contents/Resources/library/plugin"
 cp -R library/styles "$APP/Contents/Resources/library/styles"
 

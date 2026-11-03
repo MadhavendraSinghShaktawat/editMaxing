@@ -66,19 +66,71 @@ function ChoiceCard({ d, editorName }: { d: EngineDecision; editorName: string }
   );
 }
 
+type About = { action: string; command: string | null; urls: string[]; files: string[]; download: boolean; who: string; subject: string | null; footage?: boolean };
+
+const MEDIA = /\.(mp4|mov|m4v|webm|mp3|wav|m4a|jpe?g|png|gif|webp)(\?|$)/i;
+const host = (u: string) => {
+  try {
+    return new URL(u).hostname.replace(/^www\./, "");
+  } catch {
+    return u;
+  }
+};
+
+/** A download's file, shown before it's allowed, when it's a picture, a video or a sound. */
+function MediaPreview({ url }: { url: string }) {
+  const [broken, setBroken] = useState(false);
+  if (broken || !MEDIA.test(url)) return null;
+  if (/\.(jpe?g|png|gif|webp)(\?|$)/i.test(url)) return <img className="perm-media" src={url} alt="" onError={() => setBroken(true)} />;
+  if (/\.(mp3|wav|m4a)(\?|$)/i.test(url)) return <audio className="perm-media" src={url} controls preload="none" onError={() => setBroken(true)} />;
+  return <video className="perm-media" src={url} controls preload="metadata" muted onError={() => setBroken(true)} />;
+}
+
+/**
+ * An approval says who is asking, what will happen in plain words, why it needs a yes, and
+ * exactly what it touches: the web addresses (with a preview for media), the files, the command.
+ */
 function PermissionCard({ d }: { d: EngineDecision }) {
-  const { tool, reason } = d.payload as { tool: string; reason?: string };
+  const { tool, reason, about, input } = d.payload as { tool: string; reason?: string; about?: About; input?: Record<string, unknown> };
+  const a: About = about ?? { action: tool === "Bash" ? String(input?.description ?? "Run a command on this Mac") : `Use ${tool}`, command: tool === "Bash" ? String(input?.command ?? "") : null, urls: [], files: [], download: false, who: "The editor", subject: null };
   return (
-    <div className="decision">
+    <div className="decision perm">
       <div className="decision-head">
-        <span>Needs your approval</span>
-        <p>This step {reason ?? `uses ${tool}`}.</p>
+        <span>{a.who} needs your OK</span>
+        <p className="perm-action">{a.action}</p>
+        {reason && <small className="perm-why">Asking because it {reason}.</small>}
       </div>
+      {a.urls.length > 0 && (
+        <div className="perm-list">
+          <small>{a.download ? "Downloads from" : "Connects to"}</small>
+          {a.urls.map((u) => (
+            <div key={u} className="perm-url">
+              <a href={u} target="_blank" rel="noreferrer noopener">{host(u)}</a>
+              <code title={u}>{u}</code>
+              <MediaPreview url={u} />
+            </div>
+          ))}
+        </div>
+      )}
+      {a.files.length > 0 && (
+        <div className="perm-list">
+          <small>Files</small>
+          {a.files.map((f) => <code key={f} title={f}>{f.split("/").slice(-3).join("/")}</code>)}
+        </div>
+      )}
+      {a.command && (
+        <details className="perm-command">
+          <summary>{tool === "Bash" ? "Show the exact command" : "Show the details"}</summary>
+          <pre>{a.command}</pre>
+        </details>
+      )}
       <div className="decision-more strong">
         <button className="primary" onClick={() => store.answer(d.id, { allow: true })}>Allow once</button>
-        <button onClick={() => store.answer(d.id, { allow: true, always: true })}>Allow for this chat</button>
+        {a.subject && <button onClick={() => store.answer(d.id, { allow: true, always: true })}>Always allow {a.subject} in this chat</button>}
+        {!a.footage && <button onClick={() => store.answer(d.id, { allow: true, all: true })}>Allow everything in this chat</button>}
         <button onClick={() => store.answer(d.id, { allow: false })}>Don't allow</button>
       </div>
+      <small className="perm-foot">{a.footage ? "Changes to your original footage always ask." : "To stop these for every chat, turn off Ask before risky steps in Settings → Account."}</small>
     </div>
   );
 }

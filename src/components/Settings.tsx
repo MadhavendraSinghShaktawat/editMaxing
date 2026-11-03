@@ -5,7 +5,7 @@ import { Account, Client, EngineStyle, Grant, LibraryView, MemoryRule, MemorySco
 import { store, useStore } from "../sim/store";
 import { PackButton } from "./Modals";
 import { ShareEditor, sharedLabel } from "./Share";
-import { Avatar, Badge, Button, Confirm, EmptyState, FileButton, Group, IconButton, Item, Meta, Select, SettingRow, useCopy } from "./ui";
+import { Avatar, Badge, Button, Confirm, EmptyState, FileButton, Group, IconButton, Item, Meta, Segmented, Select, SettingRow, useCopy } from "./ui";
 
 type Section = "account" | "memory" | "sharing" | "mode" | "integrations" | "team" | "users" | "mac";
 
@@ -155,6 +155,12 @@ function MyAccount() {
             {a.signedIn ? <Badge tone="ok">Signed in</Badge> : <Badge>Signed out</Badge>}
           </SettingRow>
         ))}
+        <SettingRow title="Ask before risky steps" meta={s.settings.approvals === "off" ? "Editors don't ask. Changes to your original footage still do." : "Editors ask before unfamiliar commands and changes outside the video."}>
+          <Segmented label="Ask before risky steps" value={s.settings.approvals ?? "ask"} onChange={(v) => void s.attempt(async () => { await api("POST", "/api/settings", { approvals: v }); await s.refresh(); })} options={[{ id: "ask", label: "Ask" }, { id: "off", label: "Don't ask" }]} />
+        </SettingRow>
+        <SettingRow title="Learn shared references" meta="New references in chats become styles and saved motion. Known ones are reused.">
+          <Segmented label="Learn shared references" value={s.settings.autoLearn === false ? "off" : "on"} onChange={(v) => void s.attempt(async () => { await api("POST", "/api/settings", { auto_learn: v }); await s.refresh(); })} options={[{ id: "on", label: "On" }, { id: "off", label: "Off" }]} />
+        </SettingRow>
         <SettingRow title="Pause background work at" meta="Library analysis and learning wait past this share of your 5-hour limit.">
           <Select className="sm" label="Usage ceiling" value={String(s.settings.usageCeiling ?? 85)} onChange={(v) => void s.attempt(async () => { await api("POST", "/api/settings", { usage_ceiling: v }); await s.refresh(); })}>
             {[60, 70, 80, 85, 90, 95].map((n) => <option key={n} value={n}>{n}%</option>)}
@@ -930,11 +936,34 @@ function UsersSection() {
 type Doctor = Record<string, { ok: boolean; detail: string }>;
 const DOCTOR: Record<string, string> = { claude: "Claude Code", ffmpeg: "FFmpeg", native: "Native tools", python: "Python" };
 
+type EngineInfo = { build: string; service: boolean; working: { name: string; detail: string }[]; jobs: number };
+
 function ThisMac() {
+  const s = useStore();
   const [doctor, setDoctor] = useState<Doctor | null>(null);
-  useEffect(() => void store.attempt(async () => setDoctor(await api<Doctor>("GET", "/api/doctor"))), []);
+  const [engine, setEngine] = useState<EngineInfo | null>(null);
+  useEffect(() => void store.attempt(async () => {
+    setDoctor(await api<Doctor>("GET", "/api/doctor"));
+    setEngine(await api<EngineInfo>("GET", "/api/engine"));
+  }), []);
+  const canStop = s.me?.role === "owner" && s.me.local;
   return (
     <Page title="This Mac">
+      {engine && (
+        <Group title="Engine">
+          <SettingRow
+            title={<>Background engine {engine.service ? <Badge tone="ok">Running</Badge> : <Badge>Manual</Badge>}</>}
+            meta={engine.service ? "Editors keep working when the window is closed. Starts at login." : "Started by hand. Editors stop when it does."}
+          >
+            {canStop && engine.service && (
+              <Confirm confirm="Stop engine" onConfirm={() => void s.attempt(() => api("POST", "/api/engine/stop"))}>
+                Stop
+              </Confirm>
+            )}
+          </SettingRow>
+          {engine.working.length > 0 && <SettingRow title="Working now" meta={engine.working.map((w) => w.name).join(", ")} />}
+        </Group>
+      )}
       <Group title="Components">
         {!doctor && <None text="Checking…" />}
         {doctor && Object.keys(DOCTOR).filter((k) => doctor[k]).map((k) => (

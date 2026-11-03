@@ -1,10 +1,16 @@
 import { Check, Film, ImageIcon, Link2, Loader2, Paperclip, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { StoredFile, api, uploadFile } from "../sim/engine";
+import { StoredFile, api, filePrint, uploadFile } from "../sim/engine";
 import { Attachment, store } from "../sim/store";
 
 /** `link` marks a video fetched from a pasted address rather than uploaded from this computer. */
-export type Pending = Attachment & { progress: number; error?: string; source?: "link" };
+export type Pending = Attachment & {
+  progress: number; error?: string; source?: "link";
+  /** The address it came from and the download following it, so a draft can carry on after a restart. */
+  link?: string; job?: string;
+  /** A short status, such as "120 MB of 480 MB" or "Already on this Mac". */
+  note?: string;
+};
 
 const LIMITS = { image: 10 * 1024 * 1024 };
 
@@ -51,28 +57,62 @@ const shortLink = (url: string) => {
   }
 };
 
+type LinkResult = { file: StoredFile; platform: string; credits: number };
+
 export function useAttachments(defaultRole: Attachment["role"]) {
   const [items, setItems] = useState<Pending[]>([]);
   const timers = useRef<number[]>([]);
 
   useEffect(() => () => timers.current.forEach((t) => window.clearInterval(t)), []);
 
+  const update = useCallback((id: string, patch: Partial<Pending>) => setItems((v) => v.map((x) => (x.id === id ? { ...x, ...patch } : x))), []);
+  const fetched = useCallback((id: string, r: LinkResult) => update(id, { name: r.platform === "Google Drive" ? r.file.name : `${r.platform} video`, size: r.file.size, duration: r.file.meta.duration, hash: r.file.hash, job: undefined, error: undefined, progress: 1 }), [update]);
+
+  /**
+   * One link to one file. A link fetched before comes back at once; otherwise the engine downloads
+   * it in the background, and this follows that download to the end, even after a restart.
+   */
+  const fetchOne = useCallback(async (id: string, url: string, name?: string, job?: string) => {
+    const follow = (jobId: string) => store.waitJob<LinkResult>(jobId, (j) => update(id, { progress: 0.05 + 0.9 * (j.progress ?? 0), note: j.message }));
+    try {
+      if (job) {
+        try {
+          return fetched(id, await follow(job));
+        } catch {
+          // That job ended or was lost. Asking again reuses the file or the partial download.
+        }
+      }
+      const r = await api<{ file: LinkResult } | { job: string }>("POST", "/api/links/fetch", { url, name });
+      if ("file" in r) return fetched(id, r.file);
+      update(id, { job: r.job });
+      fetched(id, await follow(r.job));
+    } catch (e) {
+      update(id, { error: (e as Error).message, job: undefined });
+    }
+  }, [fetched, update]);
+
   const add = useCallback(
     async (files: Iterable<File>) => {
       for (const file of files) {
         const kind: Attachment["kind"] = file.type.startsWith("video/") ? "video" : file.type.startsWith("image/") ? "image" : "file";
-        const id = `${file.name}-${file.size}-${Date.now()}`;
+        const id = `${file.name}-${file.size}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         const tooBig = kind === "image" && file.size > LIMITS.image;
         const item: Pending = { id, name: file.name, kind, role: kind === "video" ? defaultRole : "file", size: file.size, progress: tooBig ? 0 : 0.03, error: tooBig ? "Images can be up to 10 MB" : undefined };
         setItems((v) => [...v, item]);
         if (tooBig) continue;
         const meta = kind === "video" ? await inspectVideo(file) : kind === "image" ? { thumb: URL.createObjectURL(file) } : {};
-        setItems((v) => v.map((x) => (x.id === id ? { ...x, ...meta } : x)));
+        update(id, meta);
         if (store.live) {
-          // Files stay on this Mac. The engine stores each one by content, so a re-upload costs nothing.
-          uploadFile(file, (progress) => setItems((v) => v.map((x) => (x.id === id ? { ...x, progress } : x))))
+          // A file uploaded before is recognised by its fingerprint and not sent again.
+          const print = await filePrint(file).catch(() => null);
+          const known = print ? await api<StoredFile>("GET", `/api/files/print/${print}`).catch(() => null) : null;
+          if (known) {
+            update(id, { hash: known.hash, duration: known.meta.duration, progress: 1, note: "Already on this Mac" });
+            continue;
+          }
+          uploadFile(file, (progress) => update(id, { progress }), print)
             .then((stored) => setItems((v) => v.map((x) => (x.id === id ? { ...x, hash: stored.hash, duration: x.duration ?? stored.meta.duration, progress: 1 } : x))))
-            .catch((e: Error) => setItems((v) => v.map((x) => (x.id === id ? { ...x, error: e.message } : x))));
+            .catch((e: Error) => update(id, { error: e.message }));
           continue;
         }
         const timer = window.setInterval(() => {
@@ -88,57 +128,67 @@ export function useAttachments(defaultRole: Attachment["role"]) {
         timers.current.push(timer);
       }
     },
-    [defaultRole],
+    [defaultRole, update],
   );
 
   /**
-   * A social video link, downloaded on the Mac through the person's Scrape Creators key. An
-   * unsupported link is refused at once and never added; the caller shows why.
+   * A pasted link: a Drive file, a social post, or (when `folders` is on) a Drive folder, which
+   * becomes one row per video, fetched two at a time. A refused link keeps its row and its reason.
    */
   const addLink = useCallback(
     async (url: string, folders = false): Promise<unknown> => {
-      // A Drive folder becomes one clip per video in it, fetched two at a time.
       if (folders && /drive\.google\.com\/(?:drive\/(?:u\/\d+\/)?)?folders\//.test(url)) {
         const { videos } = await api<{ videos: { id: string; name: string; url: string }[] }>("POST", "/api/links/folder", { url });
         const queued = videos.map((v, i) => ({ ...v, key: `drive-${v.id}-${Date.now()}-${i}` }));
-        setItems((list) => [...list, ...queued.map((v) => ({ id: v.key, name: v.name, kind: "video" as const, role: defaultRole, size: 0, progress: 0.02, source: "link" as const }))]);
+        setItems((list) => [...list, ...queued.map((v) => ({ id: v.key, name: v.name, kind: "video" as const, role: defaultRole, size: 0, progress: 0.02, source: "link" as const, link: v.url }))]);
         let next = 0;
         await Promise.all([0, 1].map(async () => {
           while (next < queued.length) {
             const v = queued[next++];
-            setItems((list) => list.map((x) => (x.id === v.key ? { ...x, progress: 0.3 } : x)));
-            try {
-              const r = await api<{ file: StoredFile }>("POST", "/api/links/fetch", { url: v.url });
-              setItems((list) => list.map((x) => (x.id === v.key ? { ...x, name: r.file.name, size: r.file.size, duration: r.file.meta.duration, hash: r.file.hash, progress: 1 } : x)));
-            } catch (e) {
-              setItems((list) => list.map((x) => (x.id === v.key ? { ...x, error: (e as Error).message } : x)));
-            }
+            await fetchOne(v.key, v.url, v.name);
           }
         }));
         return { count: videos.length };
       }
       const id = `link-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      // The row stays whatever happens, so a refused link keeps its reason on screen instead of vanishing.
-      setItems((v) => [...v, { id, name: shortLink(url), kind: "video", role: defaultRole, size: 0, progress: 0.05, source: "link" }]);
-      try {
-        const r = await api<{ file: StoredFile; platform: string; credits: number }>("POST", "/api/links/fetch", { url });
-        setItems((v) => v.map((x) => (x.id === id ? { ...x, name: r.platform === "Google Drive" ? r.file.name : `${r.platform} video`, size: r.file.size, duration: r.file.meta.duration, hash: r.file.hash, thumb: undefined, progress: 1 } : x)));
-        return r;
-      } catch (e) {
-        setItems((v) => v.map((x) => (x.id === id ? { ...x, error: (e as Error).message } : x)));
-        return null;
-      }
+      setItems((v) => [...v, { id, name: shortLink(url), kind: "video", role: defaultRole, size: 0, progress: 0.05, source: "link", link: url }]);
+      await fetchOne(id, url);
+      return null;
     },
-    [defaultRole],
+    [defaultRole, fetchOne],
   );
 
-  const remove = (id: string) => setItems((v) => v.filter((x) => x.id !== id));
-  const setRole = (id: string, role: Attachment["role"]) => setItems((v) => v.map((x) => (x.id === id ? { ...x, role } : x)));
+  /**
+   * Brings back a saved draft. Finished files are ready at once, downloads carry on from where
+   * they stopped, and an upload that was cut off asks for its file again.
+   */
+  const restore = useCallback((saved: Pending[]) => {
+    setItems(saved.map((x) => (x.hash || x.error || x.link ? x : { ...x, error: "The upload stopped. Add this file again." })));
+    let next = 0;
+    const pending = saved.filter((x) => !x.hash && !x.error && x.link);
+    void Promise.all([0, 1].map(async () => {
+      while (next < pending.length) {
+        const x = pending[next++];
+        await fetchOne(x.id, x.link!, x.name, x.job);
+      }
+    }));
+  }, [fetchOne]);
+
+  /** Removing a row stops its download. What was fetched so far is kept, so adding it again carries on. */
+  const remove = (id: string) => setItems((v) => {
+    const x = v.find((y) => y.id === id);
+    if (x?.job && x.progress < 1) void api("DELETE", `/api/jobs/${x.job}`).catch(() => {});
+    return v.filter((y) => y.id !== id);
+  });
+  const setRole = (id: string, role: Attachment["role"]) => update(id, { role });
+  const setTags = (id: string, tags: string[]) => update(id, { tags });
   const clear = () => setItems([]);
   // A failed item never blocks: it isn't sent, and it can be removed or left.
   const busy = items.some((x) => !x.error && x.progress < 1);
-  const ready = (): Attachment[] => items.filter((x) => !x.error && x.progress >= 1).map(({ id, name, kind, role, size, duration, thumb, hash }) => ({ id, name, kind, role, size, duration, thumb, hash }));
-  return { items, add, addLink, remove, setRole, clear, busy, ready };
+  const ready = (): Attachment[] => items.filter((x) => !x.error && x.progress >= 1).map(({ id, name, kind, role, size, duration, thumb, hash, tags }) => ({ id, name, kind, role, size, duration, thumb, hash, tags }));
+  /** What a draft keeps: everything but local previews, which are rebuilt or not needed. */
+  const snapshot = (): Pending[] => items.map(({ thumb: _thumb, ...x }) => x);
+  return { items, add, addLink, restore, remove, setRole, setTags, clear, busy, ready, snapshot };
 }
 
 export function AttachButton({ onFiles, accept }: { onFiles: (f: FileList) => void; accept?: string }) {

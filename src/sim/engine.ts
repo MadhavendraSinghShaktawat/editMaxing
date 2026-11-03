@@ -4,11 +4,13 @@ export type EngineModel = { id: string; name: string; description: string; resol
 export type Account = { id: string; label: string; kind: "subscription" | "api_key"; email: string | null; plan: string | null; signedIn: boolean; models: EngineModel[]; limits: LimitWindow[]; limitsAt: number | null };
 export type Brief = { title?: string; styleId?: string | null; reason?: string; locale?: string; script?: string };
 export type ChatStatus = "idle" | "working" | "thinking" | "needs" | "stuck" | "resting";
-export type ChatView = { id: string; name: string; look: number; ownerId?: string | null; clientId?: string | null; accountId: string; model: string; effort: string | null; status: ChatStatus; detail: string; station: string; stage: string | null; mission: Brief | null; createdAt: number };
+export type ChatView = { id: string; name: string; look: number; ownerId?: string | null; clientId?: string | null; accountId: string; model: string; effort: string | null; status: ChatStatus; detail: string; station: string; stage: string | null; mission: Brief | null; createdAt: number; context?: ContextUsage | null; parentId?: string | null };
+/** How full a chat's context window is, as Claude Code last reported it. */
+export type ContextUsage = { usedTokens: number; maxTokens: number | null; percentage: number | null; model: string | null; compactsAutomatically: boolean; autoCompactThreshold: number | null; updatedAt: number };
 export type EngineMessage = { id: number; chatId?: string; role: string; kind: string; text: string; data: Record<string, unknown> | null };
 export type EngineDecision = { id: string; chatId: string; kind: string; payload: Record<string, unknown> };
-export type StyleRule = { rule: string; area?: string; confidence?: string; evidence?: { at: number; note: string }[] };
-export type StyleArea = { summary?: string; rules?: StyleRule[] };
+export type StyleRule = { rule: string; area?: string; confidence?: string; evidence?: { at: number; note: string; ref?: number }[] };
+export type StyleArea = { summary?: string; rules?: StyleRule[]; from?: string };
 export const STYLE_AREAS = [["pacing", "Pacing"], ["editing", "Editing style"], ["audio", "Audio"], ["captions", "Captions"], ["positioning", "Positioning"], ["motion", "Motion"], ["animation", "Animation"], ["effects", "Effects and transitions"]] as const;
 export type StyleCard = { summary?: string; structure?: string; rules?: StyleRule[]; colors?: string[]; rejected?: { rule: string; reason: string }[]; unsure?: string[]; anyPerson?: string[] } & { [K in (typeof STYLE_AREAS)[number][0]]?: StyleArea };
 export type Grant = { grantee: string; permission: "use" | "add" | "edit" };
@@ -44,8 +46,27 @@ export type StoredFile = { hash: string; path: string; name: string; size: numbe
 export type State = {
   me: Me; studio: Studio; members: Colleague[]; clients: Client[]; libraries: LibraryView[]; memoryAreas: string[];
   accounts: Account[]; chats: ChatView[]; decisions: EngineDecision[]; jobs: Job[]; library: LibraryStats; styles: EngineStyle[]; motion: MotionItem[];
-  recipes: Recipe[]; memory: MemoryRule[]; packs: Pack[]; keys: Record<string, boolean>; settings: { account: string; model: string; effort: string; embedModel: string; usageCeiling?: number };
+  recipes: Recipe[]; memory: MemoryRule[]; packs: Pack[]; keys: Record<string, boolean>; settings: { account: string; model: string; effort: string; embedModel: string; usageCeiling?: number; approvals?: "ask" | "off"; autoLearn?: boolean };
 };
+
+/**
+ * A quick fingerprint of a dropped file: its name, size and date, plus a hash of its first and
+ * last 4 MB. Enough to know it was uploaded before without reading a 4 GB file. Null when the
+ * page can't hash (an insecure address), in which case the file simply uploads.
+ */
+export async function filePrint(file: File): Promise<string | null> {
+  if (!globalThis.crypto?.subtle) return null;
+  const MB4 = 4 * 1024 * 1024;
+  const head = await file.slice(0, MB4).arrayBuffer();
+  const tail = file.size > MB4 * 2 ? await file.slice(file.size - MB4).arrayBuffer() : new ArrayBuffer(0);
+  const meta = new TextEncoder().encode(`${file.name}|${file.size}|${file.lastModified}|`);
+  const all = new Uint8Array(meta.byteLength + head.byteLength + tail.byteLength);
+  all.set(meta, 0);
+  all.set(new Uint8Array(head), meta.byteLength);
+  all.set(new Uint8Array(tail), meta.byteLength + head.byteLength);
+  const digest = await crypto.subtle.digest("SHA-256", all);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 export async function api<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, { method, credentials: "same-origin", headers: body === undefined ? undefined : { "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -55,10 +76,10 @@ export async function api<T = unknown>(method: string, path: string, body?: unkn
 }
 
 /** XHR rather than fetch, because only XHR reports upload progress. */
-export function uploadFile(file: File, onProgress: (v: number) => void) {
+export function uploadFile(file: File, onProgress: (v: number) => void, print?: string | null) {
   return new Promise<StoredFile>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", `/api/files?name=${encodeURIComponent(file.name)}`);
+    xhr.open("POST", `/api/files?name=${encodeURIComponent(file.name)}${print ? `&print=${print}` : ""}`);
     xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(Math.min(0.98, e.loaded / e.total));
     xhr.onload = () => (xhr.status < 300 ? resolve(JSON.parse(xhr.responseText) as StoredFile) : reject(new Error("The upload failed.")));
     xhr.onerror = () => reject(new Error("The upload failed."));

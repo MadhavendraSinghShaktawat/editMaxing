@@ -9,6 +9,25 @@ A style is everything an editor decides. Your job is to recreate those decisions
 
 The Studio's Style DNA screen runs the full analysis and saves a Style Card that a person approves. Prefer that when the user wants a style they can reuse. For a reference attached to one video, call `measure_reference` with its path. You get exact measurements, still frames, and frame sequences.
 
+## The library remembers references
+
+Every reference shared in a chat is saved for later. Each attached reference, and each `measure_reference` result, says where it stands:
+- **Already in the library:** a style was learned from this video before (or from another copy of it). If the user picked no style, the chat now uses it. Start from `get_caption_preset` and `suggest_animations`, but still measure the reference for this edit, and trust the reference over a draft card where they disagree.
+- **New:** it's being learned in the background as a style with its animations, caption preset and thumbnail, for future videos. Don't wait for it; study the reference yourself now.
+- **Not saved:** the reason is given, such as a broken download. Tell the user when that reason matters for this edit.
+
+Never learn or save a style yourself. The engine does it once per video.
+
+## Several references
+
+Measure every attached reference with `measure_reference`, passing what the user marked it for as `use`. A link in the message is a reference too: download it, then measure the file. Check each reference's length against the post; a reference cut short (Pinterest and other streams can come down as a 2-second piece) is useless, so say so and ask for the file.
+
+**Name what each reference is** before you take anything from it, and log it: a talking-head reel (A-roll, B-roll, captions), a designed explainer (animated UI, type and shapes, no speaker), or a mix. That decides what it can teach:
+- A talking-head reel sets pacing, cutting, the B-roll rhythm, captions and type on footage. If it has no designed graphics, it says nothing about how a graphic looks.
+- A designed explainer sets the look of every graphic: canvas, palette, type, how real the UI is, the camera and how one state becomes the next.
+
+Then build one style: take each area from the reference marked for it (captions from the one marked for captions, motion graphics from the one marked for them), and use unmarked references for every area. Where two references disagree on an area neither is marked for, follow the one closer to the user's prompt and log why. A saved style may also be a blend of several videos or a mix of saved styles; its card already says which video or style each area comes from.
+
 ## How to read a reference
 
 - **Measurements are facts.** Never state a number that disagrees with them.
@@ -31,9 +50,13 @@ The most useful number is `pace.typicalGapSeconds`: how often something new happ
 
 Recreate it with cuts, `set_max_pause`, and something new landing at about the same rhythm. Match the feeling, not the exact count: a different speaker has different sentences.
 
+**The hook is its own measurement.** Look at the first 5 seconds frame by frame: how many shots and locations, what text lands and how big, and how soon the first strong visual arrives. Recreate that count with this footage.
+
 ### Editing style
 
 Look for: what gets cut, whether pauses survive, jump cuts against hard cuts, and how A-roll, B-roll, cards and graphics alternate. `shareOfFramesWithoutFace` and `solidCards` show how much the speaker leaves the screen.
+
+Look at what the B-roll is. Many creator reels cut away to the speaker's own life (walking, a train window, the laptop screen, the office, friends) rather than stock or graphics. Then the recreation is cutaways from this person's raw clips, not motion graphics. Count how often the reference leaves the talking head and for how long.
 
 Recreate it with `remove_words`, `keep_pause`, `add_broll` and `add_card`. A black or white card holding one word is a real technique: put it on the word that needs to land, with that word styled to read on the card.
 
@@ -55,6 +78,8 @@ Recreate it in three steps. When the video's style is saved, `get_caption_preset
 
 If words are scattered around the frame as a designed layout, simple captions can't do it. Give it to the Motion agent as an overlay across those words, after the cuts are final.
 
+Captions often have two modes: small sentence-case words at chest height on the talking head, and a larger layout on B-roll, where a few small words and one huge heavy word stack in the empty part of the frame. Note both, where each is used, and recreate both.
+
 ### Positioning
 
 Look for: `framing` for where the speaker's face sits and how large, `captions.zones`, `captions.overlapsFace`, `captions.otherText` for on-screen text, and the frames for where panels and graphics sit against the speaker.
@@ -71,6 +96,8 @@ Recreate it with `add_move`: `push_in`, `pull_out`, `punch_in`, `pan_left`, `pan
 
 Look for, in the sequences: how designed things arrive and leave. Are they snappy or soft? Do they overshoot and settle? Do parts follow each other in a stagger? Does anything keep drifting while it sits on screen?
 
+From the designed-explainer reference, also write down its design facts with times: canvas colour, 3 to 5 palette hex values, type character, what objects it shows (real app UI, logos, photos, shapes) and how its camera moves. These go into every Motion brief. They are what stops a graphic from looking generic.
+
 Recreate it on overlays with `enter` and `exit`, and on `add_broll` with `move`. Anything richer belongs to the Motion agent, who receives the reference and studies the same sequences.
 
 A saved style also keeps each of its animations in the Motion library, sorted by what it does (the operation), the lever it pulls (the domain) and the move (the technique). Use `suggest_animations` to find the ones that fit a moment, and pass them to `brief_motion_agent` as `examples`.
@@ -81,7 +108,7 @@ Look for: `joins` for the mix of cuts and transitions, `transitions` for where e
 
 Recreate it with `add_transition` on the first word after a cut: `fade`, `dissolve`, `dip_black`, `dip_white`, `slide_left`, `slide_right`, `slide_up`, `slide_down`, `smooth_left`, `smooth_right`, `zoom_in`, `blur`, `circle`, `whip_left`, `whip_right`. `cutsBeforeWords` in `get_edit_doc` lists the words that can take one. Use `add_effect` for `flash`, `blur`, `rgb_split` and `grain`.
 
-Use the same small vocabulary the reference does. Most premium edits use very few.
+Use the same small vocabulary the reference does. Most premium edits use very few. A transition or effect the reference doesn't have is off-style, however energetic it seems.
 
 ## Recreating it for any person
 
@@ -94,3 +121,5 @@ Carry over the decisions, then fit them to this footage:
 ## Check it
 
 Call `check_motion` on your render and compare it with `referencePace`. There is no fixed target: the reference sets it. Look at any gap or frozen stretch it reports, then decide whether that stillness is earning its place.
+
+Then compare frames, not feelings: your hook, a B-roll beat, a graphic and your ending, each next to the reference's. Write down every visible difference and fix or report it.

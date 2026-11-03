@@ -37,16 +37,26 @@ async function cutClip(doc: EditDoc, from: number, to: number, out: string) {
   return { start, end };
 }
 
-/** A chat without a saved style can still hand over what it measured from an attached reference. */
-function chatReference(chat: ChatRow, into: string) {
+/**
+ * A chat can hand over what it measured from its attached references. Several can be attached;
+ * the ones marked for motion or explainer graphics come first, then unmarked ones, newest first.
+ */
+function chatReferences(chat: ChatRow, into: string) {
   const root = join(chat.cwd, "work/reference");
-  if (!existsSync(root)) return null;
-  const newest = readdirSync(root).map((name) => join(root, name)).filter((p) => existsSync(join(p, "facts.json"))).sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0];
-  if (!newest) return null;
-  mkdirSync(into, { recursive: true });
-  const files = readdirSync(newest).filter((f) => /\.(jpg|json)$/.test(f) && !/^f\d+\.jpg$/.test(f));
-  for (const f of files) copyFileSync(join(newest, f), join(into, f));
-  return { files: files.filter((f) => f.endsWith(".jpg")), facts: JSON.parse(readFileSync(join(newest, "facts.json"), "utf8")) as Record<string, unknown>, source: json<{ source?: string }>(existsSync(join(newest, "source.json")) ? readFileSync(join(newest, "source.json"), "utf8") : null, {}).source ?? null };
+  if (!existsSync(root)) return [];
+  const found = readdirSync(root).map((name) => join(root, name)).filter((p) => existsSync(join(p, "facts.json"))).map((p) => {
+    const meta = json<{ source?: string; use?: string[] }>(existsSync(join(p, "source.json")) ? readFileSync(join(p, "source.json"), "utf8") : null, {});
+    return { dir: p, source: meta.source ?? null, use: meta.use ?? [], at: statSync(p).mtimeMs };
+  });
+  const forMotion = (u: string[]) => !u.length || u.includes("motion") || u.includes("explainer");
+  return found.filter((r) => forMotion(r.use)).sort((x, y) => Number(y.use.length > 0) - Number(x.use.length > 0) || y.at - x.at).slice(0, 4).map((r, i) => {
+    const rel = `reference/${i + 1}`;
+    const dest = join(into, String(i + 1));
+    mkdirSync(dest, { recursive: true });
+    const files = readdirSync(r.dir).filter((f) => /\.(jpg|json)$/.test(f) && !/^f\d+\.jpg$/.test(f));
+    for (const f of files) copyFileSync(join(r.dir, f), join(dest, f));
+    return { rel, files: files.filter((f) => f.endsWith(".jpg")), source: r.source, use: r.use };
+  });
 }
 
 export type MotionJob = { from: number; to: number; job: string; kind: "full_screen" | "overlay"; notes?: string };
@@ -74,7 +84,7 @@ export async function writeBrief(chat: ChatRow, docs: Docs, styles: Styles, a: M
 
   const mission = json<Brief>(chat.mission, {});
   const lines: string[] = [];
-  let referenceNote = "No reference was given for this video. Design it to feel premium, and match the section's own look.";
+  let referenceNote = "No motion reference was given for this video. Follow the motion-broll house style in $DOJO_MOTION_KIT/SKILL.md (Style defaults and Banned), and match the section's own look.";
   if (mission.styleId) {
     const pack = styles.referencePack(mission.styleId, join(dir, "reference"));
     const { measurements, rejected: _rejected, rules: _rules, ...card } = pack.style.card as Record<string, unknown>;
@@ -89,13 +99,15 @@ export async function writeBrief(chat: ChatRow, docs: Docs, styles: Styles, a: M
     if (pack.source) lines.push(`The reference video itself: ${pack.source}`);
     referenceNote = lines.join("\n");
   } else {
-    const pack = chatReference(chat, join(dir, "reference"));
-    if (pack) {
-      lines.push("Read reference/facts.json for exact measurements of the reference.");
-      if (pack.files.length) lines.push(`Frame sequences to study in reference/: ${pack.files.join(", ")}. reference/moments.json says what each row shows. Each row is one moment, frame by frame, left to right.`);
+    const packs = chatReferences(chat, join(dir, "reference"));
+    for (const pack of packs) {
+      const label = pack.use.length ? ` (marked for ${pack.use.join(", ")})` : "";
+      lines.push(`### ${pack.rel}${label}`, `Read ${pack.rel}/facts.json for exact measurements.`);
+      if (pack.files.length) lines.push(`Frame sequences to study in ${pack.rel}/: ${pack.files.join(", ")}. ${pack.rel}/moments.json says what each row shows. Each row is one moment, frame by frame, left to right.`);
       if (pack.source) lines.push(`The reference video itself: ${pack.source}`);
-      referenceNote = lines.join("\n");
     }
+    if (packs.length > 1) lines.unshift("There are several references. Take the look of every graphic (palette, type, objects, camera) from the ones marked for motion or explainer graphics, or else from the one that has designed graphics. A talking-head reference only sets type and timing.");
+    if (packs.length) referenceNote = lines.join("\n");
   }
 
   // Saved animations the editor picked travel with the brief, so the agent can study them cold.

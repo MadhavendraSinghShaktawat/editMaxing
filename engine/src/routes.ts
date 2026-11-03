@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createReadStream, existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -6,7 +7,7 @@ import type { RegistrationResponseJSON, AuthenticationResponseJSON } from "@simp
 import type { Bus } from "./bus.ts";
 import type { Accounts } from "./claude/accounts.ts";
 import type { Chats } from "./claude/chat.ts";
-import { DIRS, HOME, PORT, WEB_DIR } from "./config.ts";
+import { AS_SERVICE, DIRS, ENGINE_BUILD, HOME, PORT, SERVICE_LABEL, WEB_DIR } from "./config.ts";
 import type { Database } from "./db.ts";
 import { json } from "./db.ts";
 import type { Docs } from "./docs.ts";
@@ -21,24 +22,28 @@ import type { Jobs } from "./jobs.ts";
 import type { Library } from "./library.ts";
 import type { Memory } from "./memory.ts";
 import type { MotionKind, MotionLibrary } from "./motionlib.ts";
+import type { Links } from "./links.ts";
 import { MEMORY_AREAS } from "./memory.ts";
 import type { PackId, Packs } from "./packs.ts";
 import type { Styles } from "./styles.ts";
 import type { Access, Grant } from "./team/access.ts";
 import { exportMember } from "./team/export.ts";
 import { tailscaleServe, tailscaleStatus } from "./team/tailscale.ts";
-import { creditBalance, fetchSocialVideo, platformOf, scrapeKeyFor } from "./social.ts";
-import { downloadFile, folderVideos, parseDriveLink } from "./drive.ts";
+import { creditBalance, scrapeKeyFor } from "./social.ts";
+import { folderVideos, parseDriveLink } from "./drive.ts";
 import type { Role, StudioMode, Team, Viewer } from "./team/team.ts";
 import { isAdmin } from "./team/team.ts";
+import { autoLearnKey } from "./references.ts";
 
 export type App = {
-  db: Database; bus: Bus; files: Files; jobs: Jobs; accounts: Accounts; chats: Chats; docs: Docs; library: Library; motion: MotionLibrary;
+  db: Database; bus: Bus; files: Files; jobs: Jobs; accounts: Accounts; chats: Chats; docs: Docs; library: Library; motion: MotionLibrary; links: Links;
   styles: Styles; memory: Memory; packs: Packs; team: Team; access: Access; drive: DriveSync;
 };
 
 /** Studio-wide keys an admin manages. Epidemic Sound is per person, because its licence can't be shared. */
 const STUDIO_KEYS = new Set(["openrouter", "google_api_key"]);
+/** What a reference can be marked for. No mark means the editor studies all of it. */
+export const REFERENCE_TAGS = new Set(["editing", "motion", "explainer", "captions", "sound"]);
 const TOOL_KINDS = new Set(["removeBackground", "transcribe", "cutSilences", "reframe", "parallax", "track"]);
 const LOCAL_COOKIE = "dojo_session";
 
@@ -156,7 +161,8 @@ const str = (v: unknown, name: string, max = 500) => {
 };
 
 export function buildRouter(app: App) {
-  const { db, bus, files, jobs, accounts, chats, docs, library, motion, styles, memory, packs, team, access, drive } = app;
+  const { db, bus, files, jobs, accounts, chats, docs, library, motion, styles, memory, packs, team, access, drive, links } = app;
+  const PRINT = /^[a-f0-9]{64}$/;
   const r = new Router();
   const body = async <T = Record<string, unknown>>(c: Ctx) => (await c.body()) as T;
   const limits = new Window();
@@ -167,6 +173,15 @@ export function buildRouter(app: App) {
     const row = db.get<{ owner_id: string | null }>("SELECT owner_id FROM chats WHERE id = ?", id);
     if (!row || row.owner_id !== v.id) throw new HttpError(404, "That chat no longer exists.");
     return chats.row(id);
+  };
+  /** A chat an agent was started in is read-only: its activity shows there, but the starting chat directs it. */
+  const writableChat = (v: Viewer, id: string) => {
+    const chat = ownChat(v, id);
+    if (chat.parent_id) {
+      const parent = db.get<{ name: string }>("SELECT name FROM chats WHERE id = ?", chat.parent_id);
+      throw new HttpError(409, `${parent?.name ?? "Another chat"} started this agent. Write to ${parent?.name ?? "that chat"} to change what it does.`);
+    }
+    return chat;
   };
   const memberOf = (id: string) => {
     const m = team.member(id);
@@ -249,7 +264,7 @@ export function buildRouter(app: App) {
       memoryAreas: MEMORY_AREAS,
       packs: packs.list(),
       keys: await myKeys(v),
-      settings: { account: pref(v, "account", accounts.firstFor(v.id) ?? "default"), model: pref(v, "model", "sonnet"), effort: pref(v, "effort", "medium"), embedModel: library.embedModel, usageCeiling: Number(pref(v, "usage_ceiling", "85")) },
+      settings: { account: pref(v, "account", accounts.firstFor(v.id) ?? "default"), model: pref(v, "model", "sonnet"), effort: pref(v, "effort", "medium"), embedModel: library.embedModel, usageCeiling: Number(pref(v, "usage_ceiling", "85")), approvals: db.setting(`m:${v.id}:approvals`) === "off" ? "off" : "ask", autoLearn: db.setting(autoLearnKey(v.id)) !== "off" },
     };
   });
   r.add("GET", "/api/events", (c) => {
@@ -258,6 +273,27 @@ export function buildRouter(app: App) {
     return undefined;
   });
   r.add("GET", "/api/doctor", (c) => (must(c.viewer), packs.doctor()));
+
+  // ── The engine itself: which build runs, and whether stopping it would cut work short ──
+
+  const startedAt = Date.now();
+  r.add("GET", "/api/engine", (c) => {
+    must(c.viewer);
+    const chatsWorking = db.all<{ name: string; detail: string }>("SELECT name, detail FROM chats WHERE status IN ('working', 'thinking', 'needs') AND ended_at IS NULL");
+    const jobsRunning = db.get<{ n: number }>("SELECT COUNT(*) n FROM jobs WHERE status IN ('queued', 'running')")!.n;
+    return { build: ENGINE_BUILD, pid: process.pid, startedAt, service: AS_SERVICE, working: chatsWorking, jobs: jobsRunning };
+  });
+  /** Stops the background engine until the app next opens. Owner only, from this Mac. */
+  r.add("POST", "/api/engine/stop", (c) => {
+    const v = owner(must(c.viewer));
+    if (v.via !== "local") throw new HttpError(403, "Stop the engine from the Mac it runs on.");
+    setTimeout(() => {
+      // launchd would start a service that simply exits again, so the service is unloaded instead.
+      if (AS_SERVICE && process.getuid) spawn("/bin/launchctl", ["bootout", `gui/${process.getuid()}/${SERVICE_LABEL}`], { detached: true, stdio: "ignore" }).unref();
+      else process.kill(process.pid, "SIGTERM");
+    }, 300);
+    return { ok: true };
+  });
 
   // ── My account ───────────────────────────────────────────────
 
@@ -495,22 +531,29 @@ export function buildRouter(app: App) {
   });
   r.add("POST", "/api/chats/:id/messages", async (c) => {
     const v = must(c.viewer);
-    ownChat(v, c.params.id);
-    const b = await body<{ text?: string; attachments?: { hash: string; role?: string }[] }>(c);
+    writableChat(v, c.params.id);
+    const b = await body<{ text?: string; attachments?: { hash: string; role?: string; tags?: unknown }[]; compactFirst?: boolean }>(c);
     if (b.text && b.text.length > 20_000) throw new HttpError(400, "That message is too long.");
-    const attachments = (b.attachments ?? []).slice(0, 20).map((a) => {
+    if ((b.attachments?.length ?? 0) > 200) throw new HttpError(400, "Attach up to 200 files at once.");
+    const attachments = (b.attachments ?? []).map((a) => {
       mustOpenFile(v, a.hash);
       const f = files.get(a.hash);
       const duration = (f.meta as { duration?: number }).duration;
-      return { hash: f.hash, name: f.name, role: a.role === "reference" ? "reference" : "footage", path: f.path, kind: f.kind, duration };
+      const tags = Array.isArray(a.tags) ? a.tags.filter((t): t is string => typeof t === "string" && REFERENCE_TAGS.has(t)) : [];
+      return { hash: f.hash, name: f.name, role: a.role === "reference" ? "reference" : "footage", path: f.path, kind: f.kind, duration, tags };
     });
     if (!b.text?.trim() && !attachments.length) throw new HttpError(400, "Write a note or attach a file.");
-    await chats.send(c.params.id, b.text ?? "", attachments);
+    await chats.send(c.params.id, b.text ?? "", attachments, { compactFirst: b.compactFirst === true });
+    return { ok: true };
+  });
+  r.add("POST", "/api/chats/:id/compact", async (c) => {
+    writableChat(must(c.viewer), c.params.id);
+    await chats.compact(c.params.id);
     return { ok: true };
   });
   r.add("PATCH", "/api/chats/:id", async (c) => {
     const v = must(c.viewer);
-    ownChat(v, c.params.id);
+    writableChat(v, c.params.id);
     const b = await body<{ model?: string; effort?: string | null; accountId?: string; brief?: Record<string, string> }>(c);
     if (b.brief?.styleId && !styles.canUse(v.id, b.brief.styleId)) throw new HttpError(404, "That style isn't available to you.");
     if (b.accountId) chats.setAccount(c.params.id, b.accountId);
@@ -518,8 +561,8 @@ export function buildRouter(app: App) {
     if (b.brief) chats.setBrief(c.params.id, b.brief);
     return chats.view(chats.row(c.params.id));
   });
-  r.add("POST", "/api/chats/:id/interrupt", async (c) => (ownChat(must(c.viewer), c.params.id), await chats.interrupt(c.params.id), { ok: true }));
-  r.add("DELETE", "/api/chats/:id", (c) => (ownChat(must(c.viewer), c.params.id), chats.end(c.params.id), { ok: true }));
+  r.add("POST", "/api/chats/:id/interrupt", async (c) => (writableChat(must(c.viewer), c.params.id), await chats.interrupt(c.params.id), { ok: true }));
+  r.add("DELETE", "/api/chats/:id", (c) => (writableChat(must(c.viewer), c.params.id), chats.end(c.params.id), { ok: true }));
   r.add("GET", "/api/chats/:id/review", (c) => {
     ownChat(must(c.viewer), c.params.id);
     return db.all<{ id: number; at_seconds: number | null; text: string; kind: string; data: string | null }>("SELECT id, at_seconds, text, kind, data FROM review_items WHERE chat_id = ? ORDER BY id", c.params.id).map((i) => ({ id: i.id, atSeconds: i.at_seconds, text: i.text, kind: i.kind, data: json(i.data, null) }));
@@ -527,7 +570,7 @@ export function buildRouter(app: App) {
   r.add("GET", "/api/chats/:id/versions", (c) => (ownChat(must(c.viewer), c.params.id), docs.versions(c.params.id)));
   r.add("POST", "/api/chats/:id/restore", async (c) => {
     const v = must(c.viewer);
-    const chat = ownChat(v, c.params.id);
+    const chat = writableChat(v, c.params.id);
     const version = Number((await body(c)).version);
     if (!Number.isInteger(version) || version < 1) throw new HttpError(400, "Pick a version.");
     const out = docs.restore(c.params.id, version);
@@ -559,7 +602,48 @@ export function buildRouter(app: App) {
     const name = basename(c.query.get("name") ?? "upload").slice(0, 200);
     const f = await files.fromStream(c.req, name);
     library.grantFile(v.id, f.hash);
+    const print = c.query.get("print");
+    if (print && PRINT.test(print)) db.run("INSERT OR REPLACE INTO upload_prints (member_id, print, hash, created_at) VALUES (?, ?, ?, ?)", v.id, print, f.hash, Date.now());
     return f;
+  });
+  /**
+   * A dropped file this person already uploaded, found by its fingerprint (name, size, date and a
+   * hash of its first and last few megabytes), so it isn't sent again.
+   */
+  r.add("GET", "/api/files/print/:print", (c) => {
+    const v = must(c.viewer);
+    if (!PRINT.test(c.params.print)) throw new HttpError(400, "That isn't a file fingerprint.");
+    const row = db.get<{ hash: string }>("SELECT hash FROM upload_prints WHERE member_id = ? AND print = ?", v.id, c.params.print);
+    if (!row) throw new HttpError(404, "Not uploaded yet.");
+    try {
+      return files.get(row.hash);
+    } catch {
+      db.run("DELETE FROM upload_prints WHERE member_id = ? AND print = ?", v.id, c.params.print);
+      throw new HttpError(404, "Not uploaded yet.");
+    }
+  });
+
+  // ── Drafts: an unfinished New video or New style, kept until it starts or is discarded ──
+
+  const DRAFTS = new Set(["new-video", "new-style"]);
+  r.add("GET", "/api/drafts/:kind", (c) => {
+    const v = must(c.viewer);
+    if (!DRAFTS.has(c.params.kind)) throw new HttpError(404, "There's no such draft.");
+    const row = db.get<{ data: string; updated_at: number }>("SELECT data, updated_at FROM drafts WHERE member_id = ? AND kind = ?", v.id, c.params.kind);
+    return { draft: row ? json(row.data, null) : null, updatedAt: row?.updated_at ?? null };
+  });
+  r.add("PUT", "/api/drafts/:kind", async (c) => {
+    const v = must(c.viewer);
+    if (!DRAFTS.has(c.params.kind)) throw new HttpError(404, "There's no such draft.");
+    const data = JSON.stringify((await body(c)).draft ?? null);
+    if (data.length > 400_000) throw new HttpError(413, "That draft is too large.");
+    db.run("INSERT INTO drafts (member_id, kind, data, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(member_id, kind) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at", v.id, c.params.kind, data, Date.now());
+    return { ok: true };
+  });
+  r.add("DELETE", "/api/drafts/:kind", (c) => {
+    const v = must(c.viewer);
+    db.run("DELETE FROM drafts WHERE member_id = ? AND kind = ?", v.id, c.params.kind);
+    return { ok: true };
   });
   r.add("GET", "/api/files/:hash", (c) => {
     const v = must(c.viewer);
@@ -629,11 +713,19 @@ export function buildRouter(app: App) {
 
   r.add("POST", "/api/styles/learn", async (c) => {
     const v = must(c.viewer);
-    const b = await body<{ hash: string; accountId?: string; locale?: string }>(c);
-    mustOpenFile(v, str(b.hash, "reference", 128));
+    const b = await body<{ hash?: string; hashes?: unknown; tags?: unknown; accountId?: string; locale?: string }>(c);
+    const hashes = Array.isArray(b.hashes) ? b.hashes.map((h) => str(h, "reference", 128)) : [str(b.hash, "reference", 128)];
+    for (const h of hashes) mustOpenFile(v, h);
+    const tags = Array.isArray(b.tags) ? b.tags.map((t) => (Array.isArray(t) ? t.filter((x): x is string => typeof x === "string") : [])) : [];
     const accountId = b.accountId ?? pref(v, "account", accounts.firstFor(v.id) ?? "");
     accounts.owned(v.id, accountId);
-    return { job: styles.learn(v, b.hash, accountId, b.locale) };
+    // The same video twice counts once, and keeps the marks it was given first.
+    const unique = hashes.map((h, i) => ({ h, t: tags[i] ?? [] })).filter((x, i, all) => all.findIndex((y) => y.h === x.h) === i);
+    return { job: styles.learn(v, unique.map((x) => x.h), accountId, b.locale, unique.map((x) => x.t)) };
+  });
+  r.add("POST", "/api/styles/mix", async (c) => {
+    const b = await body<{ name?: string; parts?: Record<string, string> }>(c);
+    return styles.mix(must(c.viewer), str(b.name, "name", 80), b.parts && typeof b.parts === "object" ? b.parts : {});
   });
   r.add("GET", "/api/styles/:id/thumbnail", (c) => {
     const v = must(c.viewer);
@@ -747,7 +839,7 @@ export function buildRouter(app: App) {
   r.add("POST", "/api/integrations/scrapecreators", async (c) => {
     const v = must(c.viewer);
     const on = (await body(c)).on === true;
-    if (on && !(await secrets.has(scrapeKeyFor(v.id)))) throw new HttpError(400, "Add your Scrape Creators API key in My account first.");
+    if (on && !(await secrets.has(scrapeKeyFor(v.id)))) throw new HttpError(400, "Add your Scrape Creators API key in Settings → Account first.");
     db.setSetting(`m:${v.id}:scrapecreators`, on ? "on" : "off");
     return { connected: on };
   });
@@ -761,30 +853,15 @@ export function buildRouter(app: App) {
    * credit is spent, so an unsupported one is refused at once with the reason.
    */
   /**
-   * Any pasted video link: a Google Drive file, downloaded directly, or a social post through the
-   * person's Scrape Creators key. Either way it lands in the file store like an upload.
+   * Any pasted video link: a Google Drive file or a social post. A link fetched before returns its
+   * file at once; otherwise a background download starts, or the one already running is returned.
    */
   r.add("POST", "/api/links/fetch", async (c) => {
     const v = must(c.viewer);
-    const link = str((await body(c)).url, "link", 2000);
-    const drive = parseDriveLink(link);
-    if (/drive\.google\.com|docs\.google\.com|drive\.usercontent\.google\.com/i.test(link) && !drive) throw new HttpError(422, "That Drive link doesn't point to a video file. Open the file and copy its share link.");
-    if (drive?.kind === "folder") throw new HttpError(422, "That's a folder. Paste the link to one video file.");
-    if (drive) {
-      limits.check(`drive:${v.id}`, 30);
-      const file = await downloadFile(files, drive.id, "", await secrets.get("google_api_key")).catch((e: Error) => {
-        throw new HttpError(422, e.message.includes("isn't downloadable") || e.message.includes("refused") ? "Google Drive won't share that file. Set it to “Anyone with the link”, or upload the file." : e.message);
-      });
-      if (file.kind !== "video") throw new HttpError(422, `${file.name} isn't a video.`);
-      library.grantFile(v.id, file.hash);
-      return { file, platform: "Google Drive", credits: 0 };
-    }
-    platformOf(link);
-    const key = await secrets.get(scrapeKeyFor(v.id));
-    if (!key) throw new HttpError(400, "Add your Scrape Creators key in Settings → Account to use social links.");
-    limits.check(`social:${v.id}`, 30);
-    const r = await fetchSocialVideo(files, key, link);
-    library.grantFile(v.id, r.file.hash);
+    const b = await body<{ url?: string; name?: string }>(c);
+    limits.check(`link:${v.id}`, 240);
+    const r = await links.start(v.id, str(b.url, "link", 2000), typeof b.name === "string" ? b.name : undefined);
+    if ("file" in r) library.grantFile(v.id, r.file.file.hash);
     return r;
   });
   /** The videos in a shared Drive folder, so each can be fetched as its own raw clip. */
@@ -808,17 +885,6 @@ export function buildRouter(app: App) {
     const plain = /\.(txt|md|srt|vtt)$/i.test(f.name);
     const out = plain ? readFileSync(f.path, "utf8") : (await run("/usr/bin/textutil", ["-convert", "txt", "-stdout", f.path])).stdout;
     return { text: out.slice(0, 60_000) };
-  });
-  r.add("POST", "/api/social/fetch", async (c) => {
-    const v = must(c.viewer);
-    const link = str((await body(c)).url, "link", 2000);
-    platformOf(link);
-    const key = await secrets.get(scrapeKeyFor(v.id));
-    if (!key) throw new HttpError(400, "Add your Scrape Creators API key in Settings → My account to use video links.");
-    limits.check(`social:${v.id}`, 30);
-    const r = await fetchSocialVideo(files, key, link);
-    library.grantFile(v.id, r.file.hash);
-    return r;
   });
   // Envato is per person. Turning it on checks Envato's server answers first, so a dead connection never reaches a chat.
   r.add("POST", "/api/integrations/envato", async (c) => {
@@ -848,6 +914,15 @@ export function buildRouter(app: App) {
     if (b.account !== undefined) {
       accounts.owned(v.id, b.account);
       db.setSetting(`m:${v.id}:account`, b.account);
+    }
+    if (b.approvals !== undefined) {
+      if (b.approvals !== "ask" && b.approvals !== "off") throw new HttpError(400, "Approvals are ask or off.");
+      db.setSetting(`m:${v.id}:approvals`, b.approvals);
+      if (b.approvals === "off") chats.allowPending({ ownerId: v.id });
+    }
+    if (b.auto_learn !== undefined) {
+      if (b.auto_learn !== "on" && b.auto_learn !== "off") throw new HttpError(400, "Learning references is on or off.");
+      db.setSetting(autoLearnKey(v.id), b.auto_learn);
     }
     if (b.usage_ceiling !== undefined) {
       const n = Number(b.usage_ceiling);

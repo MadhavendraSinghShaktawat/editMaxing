@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync, mkdirSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,6 +19,8 @@ export const DIRS = {
   tmp: join(HOME, "tmp"),
   styles: join(HOME, "styles"),
   motion: join(HOME, "motion"),
+  /** Downloads in progress. Kept across restarts, so they continue instead of starting over. */
+  partial: join(HOME, "partial"),
 };
 
 /** Styles the maintainers have chosen to share with everyone. Empty until one is added. */
@@ -59,3 +61,16 @@ export const earshotPython = () => {
   const p = join(DIRS.packs, "earshot/.venv/bin/python");
   return existsSync(p) ? p : null;
 };
+
+/** The launchd label the engine runs under as a background service on macOS. */
+export const SERVICE_LABEL = "com.socialshifu.dojo.engine";
+/** Which build of the engine this is. The Mac app restarts an older engine after an update. */
+export const ENGINE_BUILD = (() => {
+  try {
+    return readFileSync(join(ROOT, "BUILD"), "utf8").trim() || "dev";
+  } catch {
+    return "dev";
+  }
+})();
+/** True when launchd runs the engine as the background service, rather than a person running it by hand. */
+export const AS_SERVICE = process.env.XPC_SERVICE_NAME === SERVICE_LABEL;

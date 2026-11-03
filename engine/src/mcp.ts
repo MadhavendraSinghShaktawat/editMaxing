@@ -27,12 +27,14 @@ import type { MotionLibrary } from "./motionlib.ts";
 import { DOMAINS, LAYERS, OPERATIONS } from "./motionlib.ts";
 import type { Styles } from "./styles.ts";
 import type { Tools } from "./tools.ts";
+import { describeReference } from "./references.ts";
+import type { References } from "./references.ts";
 
 export const EPIDEMIC_URL = "https://www.epidemicsound.com/a/mcp-service/mcp";
 /** Envato's own MCP server for Envato Elements. Search only, with no sign-in: results link to Envato, where the person downloads and licenses. */
 export const ENVATO_URL = "https://mcp.envato.com/mcp";
 
-type Deps = { db: Database; chats: () => Chats; docs: Docs; files: Files; library: Library; motion: MotionLibrary; styles: Styles; tools: Tools; memory: Memory; epidemicKey: (chat: ChatRow) => string; envato: (chat: ChatRow) => boolean; scrape: (chat: ChatRow) => boolean };
+type Deps = { db: Database; chats: () => Chats; docs: Docs; files: Files; library: Library; motion: MotionLibrary; styles: Styles; tools: Tools; memory: Memory; epidemicKey: (chat: ChatRow) => string; envato: (chat: ChatRow) => boolean; scrape: (chat: ChatRow) => boolean; fetchLink?: (chat: ChatRow, url: string) => Promise<{ file: { hash: string } }>; references?: References };
 type Result = { content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[]; isError?: boolean };
 
 const STAGES: Record<string, { station: Station; detail: string }> = {
@@ -255,7 +257,9 @@ export function dojoServer(chat: ChatRow, d: Deps) {
         operation: z.enum(OPERATIONS.map((o) => o.id) as [string, ...string[]]).optional(), domain: z.enum(DOMAINS.map((o) => o.id) as [string, ...string[]]).optional(),
         technique: z.string().optional(), layer: z.enum(LAYERS).optional(), count: z.number().int().min(3).max(5).optional(), exclude: z.array(z.string()).optional(),
       }, safe(async (a) => {
-        const results = await d.motion.suggest(owner, { ...a, styleId: json<Brief>(chats().row(id).mission, {}).styleId ?? null });
+        const styleId = json<Brief>(chats().row(id).mission, {}).styleId ?? null;
+        // A mixed style's animations live with the styles it was made from.
+        const results = await d.motion.suggest(owner, { ...a, styleIds: styleId ? d.styles.family(styleId).ids : [] });
         return text(results.length ? { options: results, next: "Look at the ones you like with view_animation. Ask with ask_choice and animationIds when the pick matters, then pass the chosen ids to brief_motion_agent as examples." } : "No saved animations match. Learn a style from a reference to fill the Motion library, or brief the Motion agent from the style alone.");
       })),
       tool("view_animation", "See a saved animation frame by frame, left to right, with its rebuild spec.", { id: z.string() }, safe(async (a) => {
@@ -268,7 +272,9 @@ export function dojoServer(chat: ChatRow, d: Deps) {
         return text({ operations: t.operations.map(({ id, label, description, count }) => ({ id, label, description, count })), domains: t.domains.map(({ id, label, count }) => ({ id, label, count })), techniques: t.techniques.filter((x) => x.count > 0).map(({ id, label, domain, count }) => ({ id, label, domain, count })) });
       })),
       tool("get_caption_preset", "The caption preset saved from this video's style, as a ready set_captions op plus the full caption notes. Check the font with list_fonts before applying it.", { id: z.string().optional().describe("A caption preset id, if the user picked a different one.") }, safe(async (a) => {
-        const preset = d.motion.captionPreset(owner, { id: a.id, styleId: json<Brief>(chats().row(id).mission, {}).styleId ?? null });
+        const styleId = json<Brief>(chats().row(id).mission, {}).styleId ?? null;
+        const family = styleId ? d.styles.family(styleId) : null;
+        const preset = d.motion.captionPreset(owner, { id: a.id, styleId }) ?? (family?.captions ? d.motion.captionPreset(owner, { styleId: family.captions }) : null);
         return text(preset ? { id: preset.id, name: preset.name, setCaptions: preset.card.setCaptions, notes: preset.card.captions } : "This video's style has no saved caption preset. Follow the Style Card's captions area.");
       })),
 
@@ -326,17 +332,21 @@ export function dojoServer(chat: ChatRow, d: Deps) {
         const r = await d.tools.runJob<{ file: { path: string }; solved: number; frames: number; quality: number }>("tool.track", { hash: f.hash });
         return text({ path: r.file.path, solvedFrames: r.solved, totalFrames: r.frames, quality: r.quality });
       })),
-      tool("measure_reference", "Measure a reference video: every cut and transition, camera moves, punch-ins, pace, captions, framing, loudness, music and sound effects. Returns facts, still frames, and frame sequences that show how things move.", { path: z.string(), locale: z.string().optional() }, safe(async (a) => {
-        const f = await stored(a.path);
+      tool("measure_reference", "Measure a reference video: every cut and transition, camera moves, punch-ins, pace, captions, framing, loudness, music and sound effects. Returns facts, still frames, and frame sequences that show how things move. Measure every attached reference, and pass what the user marked it for as use. path can also be a Drive or social video link, which is downloaded whole first.", { path: z.string(), locale: z.string().optional(), use: z.array(z.enum(["editing", "motion", "explainer", "captions", "sound"])).optional().describe("What the user marked this reference for. Leave out when it isn't marked.") }, safe(async (a) => {
+        const link = /^https?:\/\//i.test(a.path.trim());
+        if (link && !d.fetchLink) throw new Error("Links can't be downloaded here. Ask the user to attach the video file.");
+        const f = link ? (await d.fetchLink!(chat, a.path.trim())).file : await stored(a.path);
         const dir = join(chat.cwd, "work/reference", f.hash.slice(0, 8));
         mkdirSync(dir, { recursive: true });
         const m = await d.styles.measure(f.hash, a.locale ?? "en-US", dir);
         const facts = JSON.parse(d.styles.factsFor(m)) as Record<string, unknown>;
         const sheets = await d.styles.sequences(m.path, m.moments, m, dir, "motion", 6);
         writeFileSync(join(dir, "facts.json"), JSON.stringify(facts));
-        writeFileSync(join(dir, "source.json"), JSON.stringify({ source: m.path }));
+        writeFileSync(join(dir, "source.json"), JSON.stringify({ source: m.path, use: a.use ?? [] }));
         writeFileSync(join(dir, "moments.json"), JSON.stringify({ motion: sheets.map((s) => s.rows) }));
-        return text({ facts, frames: m.frames.map((path, i) => ({ path, at: Number(m.picks[i].toFixed(1)) })), sequences: sheets.map((s) => ({ path: s.path, rows: s.rows })), howToRead: "Each row of a sequence sheet is one moment shown as six frames, left to right.", transcript: m.transcript });
+        // A reference measured here (often a pasted link) joins the library the same way an attached one does.
+        const saved = d.references ? (await d.references.ensure(chats().row(id), [{ hash: f.hash, tags: a.use }]).catch(() => []))[0] : undefined;
+        return text({ library: saved ? describeReference(saved) : undefined, facts, frames: m.frames.map((path, i) => ({ path, at: Number(m.picks[i].toFixed(1)) })), sequences: sheets.map((s) => ({ path: s.path, rows: s.rows })), howToRead: "Each row of a sequence sheet is one moment shown as six frames, left to right.", transcript: m.transcript });
       })),
       tool("list_free_sfx", "List the bundled CC0 sound effects. Use the path with add_sfx.", { category: z.string().optional() }, safe(async (a) => {
         const dir = join(PLUGIN_DIR, "skills/sound-effects/sfx");

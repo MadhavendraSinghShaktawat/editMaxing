@@ -29,9 +29,9 @@ function JobItem({ job }: { job: Job }) {
 }
 
 /** A file being added: size, length, and live upload state. */
-function FileItem({ a, onRemove }: { a: Pending; onRemove: (id: string) => void }) {
+function FileItem({ a, onRemove, children }: { a: Pending; onRemove: (id: string) => void; children?: React.ReactNode }) {
   const uploading = !a.error && a.progress < 1;
-  const status = a.error ? <span className="t-bad">{a.error}</span> : uploading ? <span className="t-accent">{a.source === "link" ? "Fetching…" : "Uploading…"}</span> : <span className="t-ok">Ready</span>;
+  const status = a.error ? <span className="t-bad">{a.error}</span> : uploading ? <span className="t-accent">{a.note ?? (a.source === "link" ? "Fetching…" : "Uploading…")}</span> : <span className="t-ok">{a.note === "Already on this Mac" ? a.note : "Ready"}</span>;
   return (
     <Item
       icon={a.thumb ? <img src={a.thumb} alt="" /> : a.source === "link" ? <Link2 size={18} /> : <Film size={18} />}
@@ -40,9 +40,28 @@ function FileItem({ a, onRemove }: { a: Pending; onRemove: (id: string) => void 
       actions={<IconButton label={`Remove ${a.name}`} onClick={() => onRemove(a.id)}><X size={16} /></IconButton>}
     >
       {uploading && <Progress value={a.progress} />}
+      {children}
     </Item>
   );
 }
+
+/** What a reference is for. None picked means the editor studies all of it. */
+const REFERENCE_TAGS: { id: string; label: string }[] = [
+  { id: "editing", label: "Editing" }, { id: "motion", label: "Motion graphics" }, { id: "explainer", label: "Explainer graphics" }, { id: "captions", label: "Captions" }, { id: "sound", label: "Sound" },
+];
+
+function TagChips({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
+  return (
+    <div className="ui-chips ref-tags" role="group" aria-label="Use this reference for">
+      {REFERENCE_TAGS.map((t) => {
+        const on = value.includes(t.id);
+        return <button key={t.id} type="button" aria-pressed={on} className={`ui-chip sm ${on ? "is-on" : ""}`} onClick={() => onChange(on ? value.filter((v) => v !== t.id) : [...value, t.id])}>{t.label}</button>;
+      })}
+    </div>
+  );
+}
+
+type VideoDraft = { v: 1; footage: Pending[]; refs: Pending[]; prompt: string; script: string | null; styleId: string | null; clientId: string; locale: string; accountId: string; model: { model: string; effort: string } };
 
 // ── New video ──────────────────────────────────────────────────
 
@@ -59,6 +78,8 @@ export function NewMission({ onClose }: { onClose: () => void }) {
   const [script, setScript] = useState<string | null>(null);
   const [reading, setReading] = useState(false);
   const [clientId, setClientId] = useState("");
+  const [restored, setRestored] = useState(false);
+  const [loaded, setLoaded] = useState(false);
   const myClients = s.clients.filter((c) => c.members.includes(s.me?.id ?? "") || s.me?.role === "owner" || s.me?.role === "admin");
   const signedIn = s.accounts.filter((a) => a.signedIn);
   const video = footage.ready()[0];
@@ -68,8 +89,6 @@ export function NewMission({ onClose }: { onClose: () => void }) {
   const footageBusy = footage.items.some((x) => !x.error && x.progress < 1);
   const canStart = !!video && !footageBusy && !refs.busy && !reading;
   const reference = refs.ready();
-  // Until a reference is fetched or uploaded, the ways to add one stay on screen, even beside a failed attempt.
-  const refOpen = !refs.items.some((x) => !x.error);
   const readScript = (f: File) => void s.attempt(async () => {
     setReading(true);
     try {
@@ -80,14 +99,60 @@ export function NewMission({ onClose }: { onClose: () => void }) {
     }
   });
 
+  // The draft comes back when New video opens again, even after the app quit.
+  useEffect(() => {
+    void api<{ draft: VideoDraft | null }>("GET", "/api/drafts/new-video").then(({ draft }) => {
+      if (draft?.v === 1) {
+        footage.restore(draft.footage ?? []);
+        refs.restore(draft.refs ?? []);
+        setPrompt(draft.prompt ?? "");
+        setScript(draft.script ?? null);
+        if (!draft.styleId || s.styles.some((x) => x.id === draft.styleId)) setStyleId(draft.styleId ?? null);
+        setClientId(draft.clientId ?? "");
+        setLocale(draft.locale ?? "en-US");
+        if (draft.accountId && s.accounts.some((a) => a.id === draft.accountId)) setAccountId(draft.accountId);
+        if (draft.model?.model) setModel(draft.model);
+        setRestored(!!(draft.footage?.length || draft.refs?.length || draft.prompt || draft.script));
+      }
+    }).catch(() => {}).finally(() => setLoaded(true));
+    // Runs once, when the window opens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Every change is saved shortly after it happens. An empty window keeps no draft.
+  const draft: VideoDraft = { v: 1, footage: footage.snapshot(), refs: refs.snapshot(), prompt, script, styleId, clientId, locale, accountId, model };
+  const draftJson = JSON.stringify(draft);
+  useEffect(() => {
+    if (!loaded) return;
+    const empty = !draft.footage.length && !draft.refs.length && !prompt.trim() && !script?.trim();
+    const t = window.setTimeout(() => void (empty ? api("DELETE", "/api/drafts/new-video") : api("PUT", "/api/drafts/new-video", { draft })).catch(() => {}), 500);
+    return () => window.clearTimeout(t);
+    // draftJson stands for every field in the draft.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftJson, loaded]);
+
+  const discard = () => {
+    // Removing each row stops its download; what was fetched stays on the Mac for next time.
+    for (const x of footage.items) footage.remove(x.id);
+    for (const x of refs.items) refs.remove(x.id);
+    setPrompt("");
+    setScript(null);
+    setStyleId(null);
+    setRestored(false);
+    void api("DELETE", "/api/drafts/new-video").catch(() => {});
+  };
+
   const go = () => {
     if (!canStart) return;
+    void api("DELETE", "/api/drafts/new-video").catch(() => {});
     const ask = prompt.trim();
     const firstLine = ask.split("\n")[0].trim();
     const title = (firstLine.length > 3 ? firstLine : video.name.replace(/\.[^.]+$/, "").replace(/[-_]/g, " ")).slice(0, 60);
     const many = clips.length > 1 ? `There are ${clips.length} raw clips. Read them all, then build the best story from the strongest takes${script?.trim() ? ", following my script" : ""}.` : "";
-    const text = [ask || "Edit this video.", many, reference.length && !/reference/i.test(ask) ? "Match the attached reference." : ""].filter(Boolean).join("\n\n");
-    void s.startVideo({ title, styleId, locale, script: script?.trim() || undefined }, text, [...clips, ...reference], { accountId, ...model, clientId: clientId || null });
+    const refNote = reference.length > 1 ? `Use the ${reference.length} attached references. Take each part from the reference marked for it; study unmarked ones for everything.` : reference.length ? "Match the attached reference." : "";
+    const text = [ask || "Edit this video.", many, refNote].filter(Boolean).join("\n\n");
+    // References go first: they shape every decision, so they must never be the ones left out.
+    void s.startVideo({ title, styleId, locale, script: script?.trim() || undefined }, text, [...reference, ...clips], { accountId, ...model, clientId: clientId || null });
     onClose();
   };
 
@@ -123,6 +188,12 @@ export function NewMission({ onClose }: { onClose: () => void }) {
       }
     >
       <div className="ui-stack">
+        {restored && (
+          <div className="nm-restored ui-pop">
+            <span>Picked up where you left off</span>
+            <Button size="sm" variant="ghost" onClick={discard}>Discard</Button>
+          </div>
+        )}
         <div className="ui-field">
           {footage.items.length > 1 && <span className="ui-field-label">Raw videos<em>{clips.length} of {footage.items.length} ready</em></span>}
           {footage.items.length > 0 && <div className="ui-list nm-clips">{footage.items.map((a) => <FileItem key={a.id} a={a} onRemove={footage.remove} />)}</div>}
@@ -139,14 +210,18 @@ export function NewMission({ onClose }: { onClose: () => void }) {
         </div>
 
         <div className="ui-field">
-          <span className="ui-field-label">Reference video<em>Optional</em></span>
-          {refs.items.length > 0 && <div className="ui-list nm-ref">{refs.items.map((a) => <FileItem key={a.id} a={a} onRemove={refs.remove} />)}</div>}
-          {refOpen && (
-            <>
-              <Dropzone compact icon={<Film size={18} />} title="Edit it like another video" action="Choose a file" accept="video/*" onFiles={(f) => { refs.items.filter((x) => x.error).forEach((x) => refs.remove(x.id)); void refs.add(f.slice(0, 1)); }} />
-              <LinkInput label="Or paste a Drive, TikTok, Instagram or other video link" onLink={(u) => { refs.items.filter((x) => x.error).forEach((x) => refs.remove(x.id)); return refs.addLink(u); }} />
-            </>
+          <span className="ui-field-label">Reference videos<em>Optional</em></span>
+          {refs.items.length > 0 && (
+            <div className="ui-list nm-ref">
+              {refs.items.map((a) => (
+                <FileItem key={a.id} a={a} onRemove={refs.remove}>
+                  {!a.error && <TagChips value={a.tags ?? []} onChange={(t) => refs.setTags(a.id, t)} />}
+                </FileItem>
+              ))}
+            </div>
           )}
+          <Dropzone compact icon={<Film size={18} />} title={refs.items.length ? "Add another reference" : "Edit it like other videos"} action="Choose files" accept="video/*" multiple onFiles={(f) => void refs.add(f)} />
+          <LinkInput label="Or paste a Drive file or folder, TikTok, Instagram or other video link" onLink={(u) => refs.addLink(u, true)} />
         </div>
 
         {script === null ? (
@@ -382,7 +457,7 @@ function Rules({ rules }: { rules?: StyleRule[] }) {
       {rules.map((r) => (
         <div key={r.rule} className="sd-rule">
           <span>{r.rule}</span>
-          {r.evidence && <small>{r.evidence.map((e) => formatTime(e.at)).join(", ")}{r.confidence ? ` · ${r.confidence}` : ""}</small>}
+          {r.evidence && <small>{r.evidence.map((e) => `${e.ref ? `Video ${e.ref} ` : ""}${formatTime(e.at)}`).join(", ")}{r.confidence ? ` · ${r.confidence}` : ""}</small>}
         </div>
       ))}
     </div>
@@ -397,33 +472,12 @@ function StylesBoard({ onClose, onMotion }: { onClose: () => void; onMotion: () 
   const s = useStore();
   const [open, setOpen] = useState<string | null>(null);
   const [job, setJob] = useState<string | null>(null);
-  const [adding, setAdding] = useState(false);
+  const [panel, setPanel] = useState<"learn" | "mix" | null>(null);
   const owner = (id?: string | null) => s.members.find((m) => m.id === id)?.name ?? "a colleague";
-  const start = (f: File) =>
-    void s.attempt(async () => {
-      setAdding(true);
-      try {
-        const stored = await uploadFile(f, () => {});
-        const r = await api<{ job: string }>("POST", "/api/styles/learn", { hash: stored.hash, accountId: s.settings.account });
-        setJob(r.job);
-      } finally {
-        setAdding(false);
-      }
-    });
-  /** Learn a style straight from a social link, downloaded through the person's Scrape Creators key. */
-  const fromLink = async (url: string) => {
-    const r = await api<{ file: StoredFile; platform: string }>("POST", "/api/links/fetch", { url });
-    const j = await api<{ job: string }>("POST", "/api/styles/learn", { hash: r.file.hash, accountId: s.settings.account });
-    setJob(j.job);
-  };
-  const linkInput = <LinkInput label="Or paste a Drive, reel or TikTok link to learn from" onLink={fromLink} />;
   const running = job ? s.jobs.get(job) : null;
   const shown = s.styles.find((v) => v.id === open);
-  const learn = (variant: "primary" | "light") => (
-    <FileButton variant={variant} size={variant === "light" ? "md" : "sm"} icon={<Plus size={15} />} loading={adding} accept="video/*" onFiles={(f) => start(f[0])} title={`Claude Opus studies it on ${s.activeAccount()?.label ?? "your"} account`}>
-      New style
-    </FileButton>
-  );
+  const mixable = s.styles.filter((v) => v.status === "approved");
+  const learn = (variant: "primary" | "secondary") => <Button variant={variant} size="sm" icon={<Plus size={15} />} onClick={() => setPanel("learn")}>New style</Button>;
 
   if (shown) {
     const areas = STYLE_AREAS.filter(([id]) => shown.card[id]?.summary);
@@ -464,7 +518,7 @@ function StylesBoard({ onClose, onMotion }: { onClose: () => void; onMotion: () 
           )}
           {areas.length ? areas.map(([id, label]) => (
             <section key={id} className="ui-group">
-              <div className="ui-group-head"><h3>{label}</h3></div>
+              <div className="ui-group-head"><h3>{label}</h3>{shown.card[id]!.from && <small className="t-muted">From {shown.card[id]!.from}</small>}</div>
               {shown.card[id]!.summary && <p className="sd-summary" style={{ margin: "0 4px 10px", fontSize: 13 }}>{shown.card[id]!.summary}</p>}
               <Rules rules={shown.card[id]!.rules} />
             </section>
@@ -483,8 +537,15 @@ function StylesBoard({ onClose, onMotion }: { onClose: () => void; onMotion: () 
         {running && <div className="ui-list"><JobItem job={running} /></div>}
         {s.styles.length ? (
           <>
-            <div className="ui-toolbar"><span>{s.styles.length} {s.styles.length === 1 ? "style" : "styles"}</span>{learn("primary")}</div>
-            {linkInput}
+            <div className="ui-toolbar">
+              <span>{s.styles.length} {s.styles.length === 1 ? "style" : "styles"}</span>
+              <div className="ui-inline">
+                {mixable.length >= 2 && <Button variant="ghost" size="sm" onClick={() => setPanel("mix")}>Mix styles</Button>}
+                {learn("primary")}
+              </div>
+            </div>
+            {panel === "learn" && <NewStylePanel onStarted={(id) => { setJob(id); setPanel(null); }} onCancel={() => setPanel(null)} />}
+            {panel === "mix" && <MixStylesPanel styles={mixable} onDone={(id) => { setPanel(null); setOpen(id); }} onCancel={() => setPanel(null)} />}
             <div className="ui-cards wide">
               {s.styles.map((c) => (
                 <button key={c.id} type="button" className="ui-card" onClick={() => setOpen(c.id)}>
@@ -497,15 +558,98 @@ function StylesBoard({ onClose, onMotion }: { onClose: () => void; onMotion: () 
             </div>
           </>
         ) : (
-          !running && (
-            <>
-              <EmptyState art="grid" title="No styles yet" text="Add a reference video and Claude learns its style." action={learn("light")} />
-              {linkInput}
-            </>
-          )
+          !running && (panel === "learn"
+            ? <NewStylePanel onStarted={(id) => { setJob(id); setPanel(null); }} onCancel={() => setPanel(null)} />
+            : <EmptyState art="grid" title="No styles yet" text="Add reference videos and Claude learns their style." action={learn("primary")} />)
         )}
       </div>
     </Modal>
+  );
+}
+
+/**
+ * Learn a style from one or more reference videos. Several become one blended style; marks say
+ * what to take from each. What's added is kept as a draft until the style starts learning.
+ */
+function NewStylePanel({ onStarted, onCancel }: { onStarted: (job: string) => void; onCancel: () => void }) {
+  const s = useStore();
+  const refs = useAttachments("reference");
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    void api<{ draft: { v: 1; refs: Pending[] } | null }>("GET", "/api/drafts/new-style").then(({ draft }) => draft?.v === 1 && refs.restore(draft.refs ?? [])).catch(() => {}).finally(() => setLoaded(true));
+    // Runs once, when the panel opens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const snapshot = JSON.stringify(refs.snapshot());
+  useEffect(() => {
+    if (!loaded) return;
+    const list = JSON.parse(snapshot) as Pending[];
+    const t = window.setTimeout(() => void (list.length ? api("PUT", "/api/drafts/new-style", { draft: { v: 1, refs: list } }) : api("DELETE", "/api/drafts/new-style")).catch(() => {}), 500);
+    return () => window.clearTimeout(t);
+  }, [snapshot, loaded]);
+  const ready = refs.ready();
+  const start = () => void s.attempt(async () => {
+    setBusy(true);
+    try {
+      const r = await api<{ job: string }>("POST", "/api/styles/learn", { hashes: ready.map((x) => x.hash), tags: ready.map((x) => x.tags ?? []), accountId: s.settings.account });
+      await api("DELETE", "/api/drafts/new-style").catch(() => {});
+      onStarted(r.job);
+    } finally {
+      setBusy(false);
+    }
+  });
+  return (
+    <section className="ui-group st-panel ui-pop">
+      <div className="ui-group-head"><h3>New style</h3>{ready.length > 1 && <small className="t-muted">{ready.length} videos → one style</small>}</div>
+      {refs.items.length > 0 && (
+        <div className="ui-list nm-ref">
+          {refs.items.map((a) => (
+            <FileItem key={a.id} a={a} onRemove={refs.remove}>
+              {!a.error && refs.items.length > 1 && <TagChips value={a.tags ?? []} onChange={(t) => refs.setTags(a.id, t)} />}
+            </FileItem>
+          ))}
+        </div>
+      )}
+      <Dropzone compact icon={<Film size={18} />} title={refs.items.length ? "Add another reference" : "Drop reference videos"} action="Choose files" accept="video/*" multiple onFiles={(f) => void refs.add(f)} />
+      <LinkInput label="Or paste a Drive, reel, TikTok or other video link" onLink={(u) => refs.addLink(u, true)} />
+      <div className="ui-toolbar end">
+        <Button variant="ghost" size="sm" onClick={onCancel}>Close</Button>
+        <Button variant="primary" size="sm" icon={<Sparkles size={14} />} loading={busy} disabled={!ready.length || refs.busy || ready.length > 5} title={`Claude Opus studies ${ready.length > 1 ? "them" : "it"} on ${s.activeAccount()?.label ?? "your"} account`} onClick={start}>Learn style</Button>
+      </div>
+    </section>
+  );
+}
+
+/** A new style from areas of saved ones, such as captions from one and motion from another. */
+function MixStylesPanel({ styles, onDone, onCancel }: { styles: EngineStyle[]; onDone: (id: string) => void; onCancel: () => void }) {
+  const s = useStore();
+  const [name, setName] = useState("");
+  const [parts, setParts] = useState<Record<string, string>>(() => Object.fromEntries(STYLE_AREAS.map(([id]) => [id, id === "captions" || id === "animation" ? styles[1].id : styles[0].id])));
+  const used = new Set(Object.values(parts));
+  const create = () => void s.attempt(async () => {
+    const v = await api<{ id: string }>("POST", "/api/styles/mix", { name, parts });
+    onDone(v.id);
+  });
+  return (
+    <section className="ui-group st-panel ui-pop">
+      <div className="ui-group-head"><h3>Mix styles</h3></div>
+      <input className="ui-input" value={name} placeholder="Name the new style" aria-label="New style name" onChange={(e) => setName(e.target.value)} />
+      <div className="ui-group-card st-mix">
+        {STYLE_AREAS.map(([id, label]) => (
+          <div key={id} className="ui-row">
+            <span className="ui-row-title ui-grow">{label}</span>
+            <Select className="sm" label={`${label} from`} value={parts[id]} onChange={(v) => setParts({ ...parts, [id]: v })}>
+              {styles.map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+            </Select>
+          </div>
+        ))}
+      </div>
+      <div className="ui-toolbar end">
+        <Button variant="ghost" size="sm" onClick={onCancel}>Close</Button>
+        <Button variant="primary" size="sm" disabled={!name.trim() || used.size < 2} onClick={create}>Create style</Button>
+      </div>
+    </section>
   );
 }
 

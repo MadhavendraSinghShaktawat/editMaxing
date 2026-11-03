@@ -12,6 +12,10 @@ import { DriveSync } from "./drivesync.ts";
 import { Files, ToolCache } from "./files.ts";
 import { Jobs } from "./jobs.ts";
 import { Library } from "./library.ts";
+import { Links } from "./links.ts";
+import { References, describeReference } from "./references.ts";
+import { secrets } from "./lib/secrets.ts";
+import { scrapeKeyFor } from "./social.ts";
 import { epidemicEnv, mcpFor, scrapeEnv } from "./mcp.ts";
 import { Memory } from "./memory.ts";
 import { MotionLibrary } from "./motionlib.ts";
@@ -44,10 +48,13 @@ const docs = new Docs(db, files, tools, jobs, () => chats);
 const library = new Library(db, bus, files, jobs, accounts, () => chats.busy > 0);
 library.access = access;
 library.onSharedChange = (id) => void drive.queue(id);
+const links = new Links(db, files, jobs, { scrape: (id) => secrets.get(scrapeKeyFor(id)), google: () => secrets.get("google_api_key") });
 const motion = new MotionLibrary(db, bus, accounts);
 motion.access = access;
 motion.embedModel = () => library.embedModel;
 styles.motion = motion;
+styles.isBusy = () => chats.busy > 0;
+const references = new References(db, bus, files, styles, (chat) => chat.owner_id ?? team.owner().id);
 
 const epidemicKey = (chat: ChatRow) => epidemicKeyFor(chat.owner_id, team.owner().id);
 const scrapeOn = (chat: ChatRow) => !!chat.owner_id && db.setting(`m:${chat.owner_id}:scrapecreators`) === "on";
@@ -73,10 +80,18 @@ function isolation(chat: ChatRow) {
 }
 
 chats = new Chats(db, bus, accounts, {
-  mcp: (chat) => mcpFor(chat, { db, chats: () => chats, docs, files, library, motion, styles, tools, memory, epidemicKey, envato: (c) => db.setting(`m:${c.owner_id ?? team.owner().id}:envato`) === "on", scrape: (c) => scrapeOn(c) }),
+  mcp: (chat) => mcpFor(chat, { db, chats: () => chats, docs, files, library, motion, styles, tools, memory, epidemicKey, envato: (c) => db.setting(`m:${c.owner_id ?? team.owner().id}:envato`) === "on", scrape: (c) => scrapeOn(c), fetchLink: (c, url) => links.fetchNow(c.owner_id ?? team.owner().id, url), references }),
   prompt: (chat) => buildPrompt(chat, styles, memory, (id) => db.get<{ name: string }>("SELECT name FROM clients WHERE id = ?", id)?.name ?? null),
   env: async (chat) => ({ ...(await epidemicEnv(epidemicKey(chat))), ...(await scrapeEnv(chat.owner_id, scrapeOn(chat))) }),
   onUserMessage: (chat, text) => chat.owner_id && memory.signal({ memberId: chat.owner_id, chatId: chat.id, clientId: chat.client_id, kind: "message", text }),
+  onReferences: async (chat, refs) => {
+    const states = await references.ensure(chat, refs);
+    // The style to follow, when the user hasn't picked one: the known reference marked for editing, else the first known one.
+    const known = states.filter((x) => x.state === "known");
+    const editing = known.find((x) => refs.find((r) => r.hash === x.hash)?.tags?.includes("editing"));
+    const pick = editing ?? known[0];
+    return { notes: new Map(states.map((x) => [x.hash, describeReference(x)])), styleId: pick?.state === "known" ? pick.styleId : null };
+  },
   onTurnEnd: (chat) => memory.schedule({ id: chat.id, owner_id: chat.owner_id, client_id: chat.client_id, account_id: chat.account_id }),
   isolation,
 });
@@ -89,6 +104,15 @@ memory.onSuggest = (chatId, rule) => {
   }
 };
 team.onRemoved = (memberId) => chats.closeOwner(memberId);
+references.notify = (chatId, text) => {
+  try {
+    chats.note(chatId, "system", "text", text);
+  } catch {
+    // The chat ended while the style was learning. The style is still in Styles.
+  }
+};
+// Styles learned before prints existed get one, so their videos are recognised when shared again.
+setTimeout(() => void references.backfill().catch(() => {}), 30_000).unref();
 
 /** Every event goes only to the person whose work it is. */
 const one = (id: string | null | undefined): Audience => (id ? [id] : "admins");
@@ -120,10 +144,13 @@ bus.on((e) => {
 });
 
 await accounts.init();
-jobs.resume(["library.ingest", "library.drive", "library.analyze", "library.embed", "library.drive.sync", "style.analyze", "memory.learn", "pack.earshot", "pack.motion", "pack.depth", "pack.colmap"]);
+jobs.resume(["link.fetch", "library.ingest", "library.drive", "library.analyze", "library.embed", "library.drive.sync", "style.analyze", "memory.learn", "pack.earshot", "pack.motion", "pack.depth", "pack.colmap"]);
+
+// Turns cut off by the last shutdown carry on, now that accounts and jobs are ready.
+void chats.resumeInterrupted();
 
 const token = installToken();
-const server = createServer(handler(buildRouter({ db, bus, files, jobs, accounts, chats, docs, library, motion, styles, memory, packs, team, access, drive }), token, team));
+const server = createServer(handler(buildRouter({ db, bus, files, jobs, accounts, chats, docs, library, motion, styles, memory, packs, team, access, drive, links }), token, team));
 // Uploads and event streams stay open for a long time.
 server.requestTimeout = 0;
 server.on("error", (e: NodeJS.ErrnoException) => {

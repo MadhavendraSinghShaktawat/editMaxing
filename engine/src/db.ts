@@ -124,6 +124,15 @@ const MOTION = `
   UPDATE styles SET mode = NULL;
   UPDATE memory_rules SET mode = NULL;`;
 
+/**
+ * Version 4: nothing is fetched twice and nothing typed is lost. Links remember the file they
+ * became, dropped files remember their fingerprint per person, and New video keeps a draft.
+ */
+const RESUME = `
+  CREATE TABLE link_cache (key TEXT PRIMARY KEY, hash TEXT NOT NULL, name TEXT NOT NULL, platform TEXT NOT NULL, created_at INTEGER NOT NULL);
+  CREATE TABLE upload_prints (member_id TEXT NOT NULL, print TEXT NOT NULL, hash TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (member_id, print));
+  CREATE TABLE drafts (member_id TEXT NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (member_id, kind));`;
+
 const MIGRATIONS: Migration[] = [
   `CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
    CREATE TABLE accounts (
@@ -183,6 +192,23 @@ const MIGRATIONS: Migration[] = [
    CREATE TABLE usage_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, amount REAL NOT NULL, units REAL NOT NULL, created_at INTEGER NOT NULL);`,
   adoptExisting,
   MOTION,
+  RESUME,
+  // Version 5: the last context-window reading for each chat, for the meter and the Compact chip.
+  "ALTER TABLE chats ADD COLUMN context TEXT;",
+  // Version 6: an agent a chat started gets its own read-only chat, linked to the one that started it.
+  `ALTER TABLE chats ADD COLUMN parent_id TEXT REFERENCES chats(id);
+   ALTER TABLE chats ADD COLUMN task_id TEXT;
+   CREATE INDEX chats_parent ON chats(parent_id);`,
+  // Version 7: Pinterest streams used to come down as their first 2-second segment. Forget those
+  // downloads so the next paste fetches the whole video. The files themselves stay in the store.
+  "DELETE FROM link_cache WHERE platform = 'Pinterest';",
+  // Version 8: which videos each style was learned from, and a visual print of each, so a reference
+  // shared again (even downloaded again) reuses its style instead of being learned twice.
+  `CREATE TABLE style_sources (style_id TEXT NOT NULL REFERENCES styles(id) ON DELETE CASCADE, hash TEXT NOT NULL, PRIMARY KEY (style_id, hash));
+   CREATE INDEX style_sources_hash ON style_sources(hash);
+   INSERT OR IGNORE INTO style_sources (style_id, hash) SELECT id, source_hash FROM styles WHERE source_hash IS NOT NULL;
+   INSERT OR IGNORE INTO style_sources (style_id, hash) SELECT DISTINCT style_id, source_hash FROM motion_items WHERE style_id IN (SELECT id FROM styles) AND source_hash IS NOT NULL;
+   CREATE TABLE video_prints (hash TEXT PRIMARY KEY, duration REAL NOT NULL, frames TEXT NOT NULL, created_at INTEGER NOT NULL);`,
 ];
 
 export class Database {

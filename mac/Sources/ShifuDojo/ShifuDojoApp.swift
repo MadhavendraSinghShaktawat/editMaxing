@@ -10,9 +10,6 @@ struct ShifuDojoApp: App {
         WindowGroup("Shifu Dojo") {
             ContentView(studio: studio)
                 .frame(minWidth: 1100, minHeight: 720)
-                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
-                    studio.stop()
-                }
         }
         .defaultSize(width: 1440, height: 900)
         .commands {
@@ -22,12 +19,22 @@ struct ShifuDojoApp: App {
                     .keyboardShortcut("r")
             }
             CommandMenu("Studio") {
+                Button("Stop Background Engine…") { studio.stopEngine() }
+                    .disabled(!studio.running)
+                Divider()
                 Button("Open in Browser") { studio.openInBrowser() }
                     .keyboardShortcut("b", modifiers: [.command, .shift])
                     .disabled(studio.address == nil)
                 Button("Copy Studio Address") { studio.copyAddress() }
                     .disabled(studio.address == nil)
             }
+        }
+
+        // A small status item: who's working, and a way back into the studio.
+        MenuBarExtra {
+            MenuBarContent(studio: studio)
+        } label: {
+            Image(systemName: studio.working.isEmpty ? "film.stack" : "film.stack.fill")
         }
     }
 }
@@ -39,7 +46,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate()
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// Closing the window keeps the app in the menu bar. Editors run in the background engine either way.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// Clicking the Dock icon with no window open brings the studio back.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { true }
 }
 
 struct ContentView: View {
@@ -56,5 +67,32 @@ struct ContentView: View {
             }
         }
         .background(Color(red: 0.05, green: 0.31, blue: 0.35))
+    }
+}
+
+/// The menu-bar menu. Editors keep working here after the window is closed.
+struct MenuBarContent: View {
+    @ObservedObject var studio: Studio
+
+    var body: some View {
+        if studio.working.isEmpty {
+            Text(studio.running ? "No editors working" : "Engine stopped")
+        } else {
+            ForEach(Array(studio.working.enumerated()), id: \.offset) { _, chat in
+                Text(chat.detail.isEmpty ? "\(chat.name) is working" : "\(chat.name): \(chat.detail)")
+            }
+        }
+        Divider()
+        Button("Open Studio") { studio.openStudio() }
+        Button("Open in Browser") { studio.openInBrowser() }
+            .disabled(studio.address == nil)
+        Divider()
+        if studio.running {
+            Button("Stop Background Engine…") { studio.stopEngine() }
+        } else {
+            Button("Start Engine") { studio.startEngine() }
+        }
+        Button("Quit Shifu Dojo") { NSApp.terminate(nil) }
+            .keyboardShortcut("q")
     }
 }

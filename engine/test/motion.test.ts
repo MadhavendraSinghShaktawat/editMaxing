@@ -205,7 +205,7 @@ test("each style shows its saved thumbnail", () => {
 
 test("version 3 rebuilt sharing for motion and cleared old edit modes", () => {
   const s = studio();
-  assert.equal(s.db.get<{ user_version: number }>("PRAGMA user_version")!.user_version, 3);
+  assert.equal(s.db.get<{ user_version: number }>("PRAGMA user_version")!.user_version >= 3, true);
   s.db.run("INSERT INTO shares (resource_type, resource_id, grantee, permission, created_at) VALUES ('motion', 'x', 'team', 'use', 0)");
   assert.throws(() => s.db.run("INSERT INTO shares (resource_type, resource_id, grantee, permission, created_at) VALUES ('nope', 'x', 'team', 'use', 0)"), /CHECK/);
 });

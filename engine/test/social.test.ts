@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { checkTool } from "../src/claude/policy.ts";
-import { creditBalance, fetchSocialVideo, platformOf, safeMediaUrl, videoCandidates } from "../src/social.ts";
+import { creditBalance, fetchSocialVideo, hlsMedia, hlsVariants, platformOf, safeMediaUrl, videoCandidates } from "../src/social.ts";
 
 test("supported links are recognised without spending a credit", () => {
   const cases: [string, string][] = [
@@ -73,7 +73,7 @@ test("a bad key, a missing post and an empty account each get a clear message", 
     const { f } = fake({ "api.scrapecreators.com": () => new Response("{}", { status }) });
     await assert.rejects(fetchSocialVideo(files, "k", tiktok, { fetcher: f }), msg);
   }
-  const { f } = fake({ "api.scrapecreators.com/v1/account/credit_balance": () => Response.json({ creditCount: 1292 }) });
+  const { f } = fake({ "api.scrapecreators.com/v1/account/credit-balance": () => Response.json({ credits_remaining: 1292 }) });
   assert.equal(await creditBalance("k", f), 1292);
 });
 
@@ -101,4 +101,27 @@ test("a redirect to a private address is refused", async () => {
 
 test("Scrape Creators tools in a chat run without asking, because the person turned them on", () => {
   assert.equal(checkTool("mcp__scrapecreators__v1_tiktok_profile", {}, "/tmp/w", new Set(), []).behavior, "allow");
+});
+
+test("a Pinterest-style stream is read as one whole file, with its separate sound", () => {
+  const base = "https://v1.pinimg.com/videos/iht/hls/45/x.m3u8";
+  const master = `#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="1",URI="x_audio.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=165152,RESOLUTION=256x144,AUDIO="audio"
+x_240w.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=499472,RESOLUTION=736x414,AUDIO="audio"
+x_720w.m3u8`;
+  assert.deepEqual(hlsVariants(master, base), { url: "https://v1.pinimg.com/videos/iht/hls/45/x_720w.m3u8", bandwidth: 499472, audio: "https://v1.pinimg.com/videos/iht/hls/45/x_audio.m3u8" });
+  const ranged = `#EXTM3U
+#EXT-X-MAP:URI="x_720w.cmfv",BYTERANGE="958@0"
+#EXTINF:2.002
+#EXT-X-BYTERANGE:97905@1130
+x_720w.cmfv
+#EXTINF:2.002
+#EXT-X-BYTERANGE:74144@99035
+x_720w.cmfv`;
+  assert.deepEqual(hlsMedia(ranged, "https://v1.pinimg.com/videos/iht/hls/45/x_720w.m3u8"), { seconds: 4.004, file: "https://v1.pinimg.com/videos/iht/hls/45/x_720w.cmfv" });
+  // Ordinary segmented streams stay with ffmpeg, but their length is still known for the check.
+  const segmented = "#EXTM3U\n#EXTINF:6.0,\nseg1.ts\n#EXTINF:4.5,\nseg2.ts";
+  assert.deepEqual(hlsMedia(segmented, "https://v.redd.it/a/HLSPlaylist.m3u8"), { seconds: 10.5, file: null });
 });

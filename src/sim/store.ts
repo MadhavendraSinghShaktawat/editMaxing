@@ -3,7 +3,7 @@ import { DOCK, Facing, STATIONS, Spot, StationId } from "../world/layout";
 import { findPath } from "../world/nav";
 import { Pose } from "../world3d/types";
 import { BROLL_PROMPTS, CHAT_NAMES, CREW_SEED, Mission, QUEUED_MISSIONS, STAGES, StageId, Thumb } from "./data";
-import { Account, Brief, ChatStatus, ChatView, Client, Colleague, EngineDecision, EngineMessage, EngineStyle, EventType, Job, MotionItem, LibraryStats, LibraryView, Me, MemoryRule, Pack, Recipe, State, Studio, api, connect, leftOf } from "./engine";
+import { Account, Brief, ContextUsage, ChatStatus, ChatView, Client, Colleague, EngineDecision, EngineMessage, EngineStyle, EventType, Job, MotionItem, LibraryStats, LibraryView, Me, MemoryRule, Pack, Recipe, State, Studio, api, connect, leftOf } from "./engine";
 
 export type Activity = "working" | "walking" | "thinking" | "needs" | "coffee" | "chatting" | "celebrating" | "resting" | "stuck" | "waiting";
 
@@ -26,6 +26,10 @@ export type Message = {
   error?: boolean;
   /** A lesson memory wants to keep, waiting for one tap. */
   memory?: { ruleId: string; clientId: string | null };
+  /** On "started the Motion agent": the agent's own chat, to watch it. */
+  childId?: string;
+  /** A context compaction, shown as a divider: running, then the tokens before and after. */
+  compaction?: { status: "running" | "done" | "failed"; before?: number; after?: number; error?: string };
 };
 
 export type Attachment = {
@@ -37,6 +41,8 @@ export type Attachment = {
   duration?: number;
   thumb?: string;
   hash?: string;
+  /** What a reference is for: editing, motion, explainer, captions, sound. None means all of it. */
+  tags?: string[];
 };
 
 export type Editor = {
@@ -74,6 +80,10 @@ export type Editor = {
   loaded: boolean;
   questions: EngineDecision[];
   started: boolean;
+  /** The last context-window reading, for the meter and the Compact chip. */
+  context?: ContextUsage | null;
+  /** Set when another chat started this agent. Such a chat is read-only. */
+  parentId?: string | null;
 };
 
 export const MAX_EDITORS = 8;
@@ -140,6 +150,35 @@ class Store {
   keys: Record<string, boolean> = {};
   library: LibraryStats | null = null;
   jobs = new Map<string, Job>();
+  private jobWaiters = new Map<string, Set<(j: Job) => void>>();
+
+  /**
+   * Follows a background job to its end, reporting progress on the way. A job that already
+   * finished, even before a restart, is read back from the engine instead of waited on.
+   */
+  waitJob<T = unknown>(id: string, onProgress?: (j: Job) => void): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const settle = (j: Job) => {
+        if (j.status === "done") (done(), resolve(j.result as T));
+        else if (j.status === "failed" || j.status === "cancelled") (done(), reject(new Error(j.error ?? "That didn't finish.")));
+        else onProgress?.(j);
+      };
+      const set = this.jobWaiters.get(id) ?? new Set<(j: Job) => void>();
+      const done = () => {
+        set.delete(settle);
+        if (!set.size) this.jobWaiters.delete(id);
+      };
+      set.add(settle);
+      this.jobWaiters.set(id, set);
+      const known = this.jobs.get(id);
+      if (known && known.status !== "queued" && known.status !== "running") return settle(known);
+      void api<Job[]>("GET", "/api/jobs").then((list) => {
+        const j = list.find((x) => x.id === id);
+        if (j) settle(j);
+        else (done(), reject(new Error("That download is no longer running. Add it again.")));
+      }).catch(() => {});
+    });
+  }
   settings: State["settings"] = { account: "default", model: "sonnet", effort: "medium", embedModel: "", usageCeiling: 85 };
   login: { id: string; status: string; url?: string; label?: string } | null = null;
   pendingDraft: string | null = null;
@@ -244,6 +283,8 @@ class Store {
     e.mission = this.missionOf(c);
     e.model = c.model;
     e.effort = c.effort ?? "";
+    e.context = c.context ?? null;
+    e.parentId = c.parentId ?? null;
     e.accountId = c.accountId;
     e.status = c.status;
     if (c.stage) e.stage = STAGE_INDEX[c.stage] ?? e.stage;
@@ -272,8 +313,10 @@ class Store {
     const from = m.role === "user" ? "user" : m.role === "system" ? "system" : "editor";
     const out: Message = { id: m.id, from, text: m.text };
     if (m.kind === "tool") out.tool = m.text;
+    if (typeof d.childId === "string") out.childId = d.childId;
     if (m.kind === "memory.suggest" && typeof d.ruleId === "string") out.memory = { ruleId: d.ruleId, clientId: (d.clientId as string | null) ?? null };
     if (m.kind === "error") out.error = true;
+    if (m.kind === "compaction") out.compaction = d as NonNullable<Message["compaction"]>;
     if (m.kind === "video") {
       const name = String(d.path ?? "").split("/").pop() ?? "";
       const part = (p: unknown) => (p ? `/api/chats/${chatId}/out/${encodeURIComponent(String(p).split("/").pop()!)}` : null);
@@ -312,7 +355,10 @@ class Store {
         if (!e) break;
         e.started = true;
         if (m.kind === "text" && m.role === "editor") e.draft = "";
-        if (e.loaded && !e.messages.some((v) => v.id === m.id)) e.messages.push(this.toMessage(m, m.chatId));
+        // A compaction row changes in place, from running to done.
+        const at = e.messages.findIndex((v) => v.id === m.id);
+        if (e.loaded && at >= 0 && (m as { amended?: boolean }).amended) e.messages[at] = this.toMessage(m, m.chatId);
+        else if (e.loaded && at < 0) e.messages.push(this.toMessage(m, m.chatId));
         break;
       }
       case "delta": {
@@ -348,7 +394,9 @@ class Store {
         break;
       case "job": {
         const j = data as Job;
-        this.jobs.set(j.id, { ...this.jobs.get(j.id), ...j });
+        const merged = { ...this.jobs.get(j.id), ...j };
+        this.jobs.set(j.id, merged);
+        for (const w of this.jobWaiters.get(j.id) ?? []) w(merged);
         break;
       }
       case "library":
@@ -541,7 +589,7 @@ class Store {
       void this.createChat();
       return null;
     }
-    if (this.editors.length >= MAX_EDITORS) {
+    if (this.editors.filter((x) => !x.parentId).length >= MAX_EDITORS) {
       this.toast = { text: `Your studio is full. End a chat to make room for another editor.`, id: uid() };
       this.emit();
       return null;
@@ -684,11 +732,11 @@ class Store {
     void this.attempt(() => api("PATCH", `/api/chats/${editorId}`, { accountId }));
   }
 
-  send(editorId: string, text: string, attachments: Attachment[] = []) {
+  send(editorId: string, text: string, attachments: Attachment[] = [], options: { compactFirst?: boolean } = {}) {
     const e = this.editors.find((v) => v.id === editorId);
     if (!e || (!text.trim() && !attachments.length)) return;
     if (this.live) {
-      void this.attempt(() => api("POST", `/api/chats/${editorId}/messages`, { text, attachments: attachments.map((a) => ({ hash: a.hash, role: a.role })) }));
+      void this.attempt(() => api("POST", `/api/chats/${editorId}/messages`, { text, attachments: attachments.map((a) => ({ hash: a.hash, role: a.role, tags: a.tags })), compactFirst: options.compactFirst === true }));
       return;
     }
     e.messages.push({ id: uid(), from: "user", text, attachments });
